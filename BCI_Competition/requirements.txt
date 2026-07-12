@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cu113
+
+torch==1.12.0+cu113
+numpy
+scipy
+scikit-learn
+mne>=1.0
+moabb>=1.4
+mne-bids
+matplotlib
+einops
+timm

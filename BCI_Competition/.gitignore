@@ -1,0 +1,11 @@
+data/public/*
+!data/public/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+results/checkpoints/*
+!results/checkpoints/.gitkeep
+results/figures/*
+!results/figures/.gitkeep
+results/tables/*
+!results/tables/.gitkeep
+__pycache__/
