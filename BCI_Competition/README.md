@@ -46,17 +46,21 @@ BCI_Competition/
 
 ## 环境安装
 
-建议使用 Python 3.10 的 conda 环境，例如：
+原仓库 `requirements.txt` 保留旧版 CUDA 11.3 兼容环境，不能用于本项目的 RTX 5070 正式基线。250 Hz OOF 基线固定使用：
 
-```bat
-conda activate BCI2026
-set PYTHONNOUSERSITE=1
-python -m pip install -r BCI_Competition\requirements.txt
+```powershell
+conda env create -f BCI_Competition/environment-bciml-repro.yml
+conda activate bciml-repro
+$env:PYTHONNOUSERSITE=1
 ```
 
-如果你使用 CPU 版 PyTorch，可以按自己的 CUDA/CPU 环境替换 `requirements.txt` 里的 `torch==1.12.0+cu113`。
+本轮实测身份为 Python 3.10.20、PyTorch 2.11.0+cu128、CUDA runtime 12.8、cuDNN 9.19、NumPy 1.26.4、MNE 1.11.0 和 MOABB 1.2.0。正式训练合同还会绑定实际 GPU 名称和计算能力；不同执行指纹不得续跑同一输出目录。
 
-项目同时提供了 `requirement.txt` 和 `requirements.txt`，两者内容相同。
+环境验收：
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(), torch.cuda.get_device_capability())"
+```
 
 ## 下载数据集
 
