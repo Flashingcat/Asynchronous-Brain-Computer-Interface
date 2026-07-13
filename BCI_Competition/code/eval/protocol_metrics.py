@@ -17,9 +17,16 @@ WINDOW_SAMPLES = 500
 STEP_SAMPLES = 125
 MIN_OVERLAP_SECONDS = 0.5
 READY = "READY"
+TASK_CANDIDATE = "TASK_CANDIDATE"
 WAIT_IDLE = "WAIT_IDLE"
 STATEFUL_STRICT = "stateful_strict"
+STATEFUL_CANDIDATE = "stateful_candidate"
 STATELESS_DIAGNOSTIC = "stateless_diagnostic"
+CANDIDATE_OPEN = "candidate_open"
+CANDIDATE_ABORT_STAGE1 = "candidate_abort_stage1"
+CANDIDATE_TIMEOUT = "candidate_timeout"
+COMMAND_COMMIT = "command_commit"
+IDLE_RESET = "idle_reset"
 STAGE1_CLASS_NAMES = ("idle", "task")
 STAGE2_CLASS_NAMES = ("left_hand", "right_hand", "feet", "tongue")
 FINAL_CLASS_NAMES = ("idle", *STAGE2_CLASS_NAMES)
@@ -114,6 +121,7 @@ class DecisionRecord:
     emitted_class: int = NO_COMMAND
     decision_state_before: str | None = None
     decision_state_after: str | None = None
+    transition_reason: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -128,7 +136,7 @@ class DecisionRecord:
             self.window_start_sample, self.window_stop_sample,
         ) < 0:
             raise ValueError("身份索引和原生采样坐标不得为负")
-        for name in ("decision_state_before", "decision_state_after"):
+        for name in ("decision_state_before", "decision_state_after", "transition_reason"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"{name} 必须为字符串或 None")
@@ -495,31 +503,66 @@ def _validate_online_inputs(
         ):
             raise ValueError("决策窗口坐标与冻结母索引不一致")
 
-    # 模式必须显式选择；严格状态轨迹与无状态诊断不能共享一个含糊输出。
+    # 模式必须显式选择；两状态基线、三状态候选策略和无状态诊断分别校验。
     for stream_records in records_by_stream.values():
         if mode == STATELESS_DIAGNOSTIC:
             if any(
                 record.decision_state_before is not None or record.decision_state_after is not None
+                or record.transition_reason is not None
                 for record in stream_records
             ):
-                raise ValueError("无状态诊断模式不得混入状态字段")
+                raise ValueError("无状态诊断模式不得混入状态字段或转换原因")
             continue
+
+        allowed_states = (
+            (READY, WAIT_IDLE)
+            if mode == STATEFUL_STRICT
+            else (READY, TASK_CANDIDATE, WAIT_IDLE)
+        )
         if any(
-            record.decision_state_before not in (READY, WAIT_IDLE)
-            or record.decision_state_after not in (READY, WAIT_IDLE)
+            record.decision_state_before not in allowed_states
+            or record.decision_state_after not in allowed_states
             for record in stream_records
         ):
-            raise ValueError("严格状态模式要求每个窗口完整记录 READY/WAIT_IDLE")
+            required = "/".join(allowed_states)
+            raise ValueError(f"{mode} 要求每个窗口完整记录 {required}")
         ordered = sorted(stream_records, key=lambda item: (item.window_stop_sample, item.window_index))
         if ordered[0].decision_state_before != READY:
             raise ValueError("每个 segment 的决策状态必须从 READY 开始")
         for index, record in enumerate(ordered):
             transition = (record.decision_state_before, record.decision_state_after)
-            if record.emitted_class != NO_COMMAND:
-                if transition != (READY, WAIT_IDLE):
-                    raise ValueError("MI 指令只能从 READY 发出并立即进入 WAIT_IDLE")
-            elif transition not in {(READY, READY), (WAIT_IDLE, WAIT_IDLE), (WAIT_IDLE, READY)}:
-                raise ValueError("无输出窗口包含非法状态转换")
+            if mode == STATEFUL_STRICT:
+                if record.transition_reason is not None:
+                    raise ValueError("两状态严格基线不得混入候选态转换原因")
+                if record.emitted_class != NO_COMMAND:
+                    if transition != (READY, WAIT_IDLE):
+                        raise ValueError("MI 指令只能从 READY 发出并立即进入 WAIT_IDLE")
+                elif transition not in {(READY, READY), (WAIT_IDLE, WAIT_IDLE), (WAIT_IDLE, READY)}:
+                    raise ValueError("无输出窗口包含非法状态转换")
+            else:
+                # 候选态的原因字段与状态转换一一绑定，避免轨迹声称的退出原因和行为不符。
+                no_command_contract = {
+                    (READY, READY): {None},
+                    (READY, TASK_CANDIDATE): {CANDIDATE_OPEN},
+                    (TASK_CANDIDATE, TASK_CANDIDATE): {None},
+                    (TASK_CANDIDATE, READY): {
+                        CANDIDATE_ABORT_STAGE1,
+                        CANDIDATE_TIMEOUT,
+                    },
+                    (WAIT_IDLE, WAIT_IDLE): {None},
+                    (WAIT_IDLE, READY): {IDLE_RESET},
+                }
+                if record.emitted_class != NO_COMMAND:
+                    if (
+                        transition != (TASK_CANDIDATE, WAIT_IDLE)
+                        or record.transition_reason != COMMAND_COMMIT
+                    ):
+                        raise ValueError("候选策略只能从 TASK_CANDIDATE 提交命令并进入 WAIT_IDLE")
+                elif (
+                    transition not in no_command_contract
+                    or record.transition_reason not in no_command_contract[transition]
+                ):
+                    raise ValueError("候选策略包含非法状态转换或转换原因")
             if index and ordered[index - 1].decision_state_after != record.decision_state_before:
                 raise ValueError("相邻窗口的决策状态不连续")
     return segment_map, expected_map, decision_map
@@ -539,6 +582,139 @@ def _latency_summary(latencies_seconds: list[float]) -> dict:
     }
 
 
+def _candidate_diagnostics(
+    segments: Sequence[ScoringSegment],
+    events: Sequence[MIEvent],
+    decisions: Sequence[DecisionRecord],
+    matches: Sequence[dict],
+    *,
+    sampling_rate: float,
+    margin_samples: int,
+) -> dict:
+    """从已完成的三状态轨迹统计候选区间，不让真值反向参与状态转换。"""
+    intervals: list[dict] = []
+    completed_dwell: list[float] = []
+    by_stream: dict[tuple[int, int, int, int], list[DecisionRecord]] = {}
+    for record in decisions:
+        by_stream.setdefault(record.key, []).append(record)
+
+    # 候选时长从 READY->TASK_CANDIDATE 的决策时刻算到退出候选态的决策时刻。
+    for key, stream in sorted(by_stream.items()):
+        ordered = sorted(stream, key=lambda item: (item.window_stop_sample, item.window_index))
+        opened: DecisionRecord | None = None
+        for record in ordered:
+            if record.transition_reason == CANDIDATE_OPEN:
+                opened = record
+                continue
+            if record.transition_reason not in {
+                CANDIDATE_ABORT_STAGE1,
+                CANDIDATE_TIMEOUT,
+                COMMAND_COMMIT,
+            }:
+                continue
+            if opened is None:  # 前置状态校验已保证不会发生，保留断言防止以后漂移。
+                raise RuntimeError("候选退出缺少对应的候选打开记录")
+            dwell = (record.window_stop_sample - opened.window_stop_sample) / sampling_rate
+            completed_dwell.append(float(dwell))
+            intervals.append({
+                "subject_id": key[0],
+                "session_id": key[1],
+                "run_id": key[2],
+                "segment_id": key[3],
+                "open_window_index": opened.window_index,
+                "open_decision_sample": opened.window_stop_sample,
+                "exit_window_index": record.window_index,
+                "exit_decision_sample": record.window_stop_sample,
+                "outcome": record.transition_reason,
+                "duration_seconds": float(dwell),
+            })
+            opened = None
+        if opened is not None:
+            observed = (ordered[-1].window_stop_sample - opened.window_stop_sample) / sampling_rate
+            intervals.append({
+                "subject_id": key[0],
+                "session_id": key[1],
+                "run_id": key[2],
+                "segment_id": key[3],
+                "open_window_index": opened.window_index,
+                "open_decision_sample": opened.window_stop_sample,
+                "exit_window_index": None,
+                "exit_decision_sample": None,
+                "outcome": "segment_end_unresolved",
+                "duration_seconds": float(observed),
+            })
+
+    outcome_counts = {
+        reason: sum(item["outcome"] == reason for item in intervals)
+        for reason in (
+            CANDIDATE_ABORT_STAGE1,
+            CANDIDATE_TIMEOUT,
+            COMMAND_COMMIT,
+            "segment_end_unresolved",
+        )
+    }
+    open_count = len(intervals)
+    abort_count = outcome_counts[CANDIDATE_ABORT_STAGE1] + outcome_counts[CANDIDATE_TIMEOUT]
+    valid_seconds = sum(item.stop_sample - item.start_sample for item in segments) / sampling_rate
+
+    # “超时相关 MISS”只表示同一事件可评分区间内出现过超时，不声称超时是 MISS 的因果来源。
+    event_lookup = {
+        (*event.key, event.event_id): event
+        for event in events
+    }
+    timeout_records = [
+        record for record in decisions
+        if record.transition_reason == CANDIDATE_TIMEOUT
+    ]
+    miss_matches = [
+        item for item in matches
+        if item["scorable"] and item["outcome"] == "miss"
+    ]
+    timeout_related_miss_events: list[dict] = []
+    for item in miss_matches:
+        identity = (
+            item["subject_id"], item["session_id"], item["run_id"], item["segment_id"],
+            item["event_id"],
+        )
+        event = event_lookup[identity]
+        if any(_eligible(record, event, margin_samples) for record in timeout_records):
+            timeout_related_miss_events.append({
+                "subject_id": item["subject_id"],
+                "session_id": item["session_id"],
+                "run_id": item["run_id"],
+                "segment_id": item["segment_id"],
+                "event_id": item["event_id"],
+            })
+
+    def ratio(numerator: int) -> float | None:
+        return None if open_count == 0 else numerator / open_count
+
+    return {
+        "candidate_open_count": open_count,
+        "candidate_opens_per_valid_minute": (
+            None if valid_seconds <= 0 else open_count / (valid_seconds / 60.0)
+        ),
+        "candidate_command_count": outcome_counts[COMMAND_COMMIT],
+        "candidate_conversion_rate": ratio(outcome_counts[COMMAND_COMMIT]),
+        "candidate_abort_count": abort_count,
+        "candidate_abort_rate": ratio(abort_count),
+        "candidate_stage1_abort_count": outcome_counts[CANDIDATE_ABORT_STAGE1],
+        "candidate_stage1_abort_rate": ratio(outcome_counts[CANDIDATE_ABORT_STAGE1]),
+        "candidate_timeout_count": outcome_counts[CANDIDATE_TIMEOUT],
+        "candidate_timeout_rate": ratio(outcome_counts[CANDIDATE_TIMEOUT]),
+        "candidate_unresolved_count": outcome_counts["segment_end_unresolved"],
+        "candidate_unresolved_rate": ratio(outcome_counts["segment_end_unresolved"]),
+        "completed_candidate_dwell_seconds": _latency_summary(completed_dwell),
+        "miss_event_with_candidate_timeout_count": len(timeout_related_miss_events),
+        "miss_event_with_candidate_timeout_rate": (
+            None if not miss_matches else len(timeout_related_miss_events) / len(miss_matches)
+        ),
+        "miss_event_with_candidate_timeout_events": timeout_related_miss_events,
+        "timeout_miss_interpretation": "associated_with_timeout_not_proven_causal",
+        "candidate_intervals": intervals,
+    }
+
+
 def evaluate_online_events(
     segments: Sequence[ScoringSegment],
     events: Sequence[MIEvent],
@@ -552,8 +728,10 @@ def evaluate_online_events(
     step_samples: int = STEP_SAMPLES,
 ) -> dict:
     """按 0.5 秒证据 margin、首次输出和有效 IDLE 时长计算事件指标。"""
-    if mode not in (STATEFUL_STRICT, STATELESS_DIAGNOSTIC):
-        raise ValueError("mode 必须显式选择 stateful_strict 或 stateless_diagnostic")
+    if mode not in (STATEFUL_STRICT, STATEFUL_CANDIDATE, STATELESS_DIAGNOSTIC):
+        raise ValueError(
+            "mode 必须显式选择 stateful_strict、stateful_candidate 或 stateless_diagnostic"
+        )
     sampling_rate = _finite_float(sampling_rate, "sampling_rate")
     min_overlap_seconds = _finite_float(min_overlap_seconds, "min_overlap_seconds")
     if sampling_rate != NATIVE_SAMPLING_RATE:
@@ -721,7 +899,14 @@ def evaluate_online_events(
         }
         for item in sorted(decisions, key=lambda value: (*value.key, value.window_index))
     ]
-    return {
+    if mode == STATEFUL_CANDIDATE:
+        for row, item in zip(
+            decision_rows,
+            sorted(decisions, key=lambda value: (*value.key, value.window_index)),
+        ):
+            row["transition_reason"] = item.transition_reason
+
+    result = {
         "evaluation_mode": mode,
         "sampling_rate": float(sampling_rate),
         "min_overlap_seconds": float(min_overlap_seconds),
@@ -758,9 +943,19 @@ def evaluate_online_events(
         "additional_event_command_count": additional_event_commands,
         "additional_event_command_interpretation": (
             "possible_output_after_premature_rearm"
-            if mode == STATEFUL_STRICT
+            if mode in (STATEFUL_STRICT, STATEFUL_CANDIDATE)
             else "multiple_stateless_outputs_within_one_event"
         ),
         "emitted_command_count": sum(item.emitted_class != NO_COMMAND for item in ordered_decisions),
         "event_matches": matches,
     }
+    if mode == STATEFUL_CANDIDATE:
+        result["candidate_diagnostics"] = _candidate_diagnostics(
+            segments,
+            events,
+            decisions,
+            matches,
+            sampling_rate=sampling_rate,
+            margin_samples=margin_samples,
+        )
+    return result

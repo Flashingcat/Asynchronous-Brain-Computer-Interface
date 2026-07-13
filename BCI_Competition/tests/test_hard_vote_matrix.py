@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -27,10 +28,14 @@ from protocol_metrics import (  # noqa: E402
 from run_epoch50_online_oof import KNOWN_SEEDS, KNOWN_SUBJECTS  # noqa: E402
 from run_hard_vote_matrix import (  # noqa: E402
     CORE_FIELDS,
+    FROZEN_INPUT_CHILD_SOURCE_SHA256,
+    FROZEN_INPUT_MASTER_SOURCE_SHA256,
     aggregate_subject_matrix,
     runtime_environment,
     validate_policy_config,
 )
+from run_epoch50_online_oof import file_hash  # noqa: E402
+from run_epoch50_online_oof_all_subjects import verify_child_artifacts  # noqa: E402
 
 
 def make_windows(count: int, *, segment: int = 0, offset: int = 0) -> list[ExpectedWindow]:
@@ -108,6 +113,67 @@ class HardVotePolicyTests(unittest.TestCase):
 
 
 class HardVoteMatrixContractTests(unittest.TestCase):
+    def test_historical_source_contract_is_checked_without_current_source_equality(self) -> None:
+        self.assertEqual(
+            FROZEN_INPUT_MASTER_SOURCE_SHA256["single_subject_runner"],
+            FROZEN_INPUT_CHILD_SOURCE_SHA256["runner"],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            protocol_id = "historical_input_fixture"
+
+            def artifact(name: str, payload: str) -> dict[str, str]:
+                path = root / name
+                path.write_text(payload, encoding="utf-8")
+                return {"file": name, "sha256": file_hash(path)}
+
+            log = artifact("run_log.json", json.dumps({
+                "status": "PASS",
+                "protocol_id": protocol_id,
+                "subject": 1,
+                "seeds": [42],
+            }))
+            seed_artifacts = {
+                "42": {
+                    role: artifact(f"{role}.txt", role)
+                    for role in ("scores_and_decisions", "stateless_metrics", "stateful_metrics")
+                }
+            }
+            records = [
+                {
+                    "fold": fold,
+                    "seed": 42,
+                    "stage": stage,
+                    "validation_runs": [fold],
+                    "train_runs": [],
+                    "saved_oof_reproduction_max_abs_error": 0.0,
+                    "continuous_window_count": 2,
+                }
+                for fold in range(6)
+                for stage in (1, 2)
+            ]
+            frozen = {role: str(index) * 64 for index, role in enumerate(
+                ("runner", "protocol_metrics", "oof_training_bundle_reader", "model_factory", "eegnet"),
+                start=1,
+            )}
+            manifest = {
+                "protocol_id": protocol_id,
+                "inventory_contract": {"inventory": {"window_count": 12}},
+                "checkpoint_records": records,
+                "source_sha256": frozen,
+                "run_log": log,
+                "seed_artifacts": seed_artifacts,
+            }
+            verify_child_artifacts(
+                root, manifest, 1, (42,), expected_source_hashes=frozen,
+            )
+            changed = copy.deepcopy(manifest)
+            changed["source_sha256"]["protocol_metrics"] = "f" * 64
+            with self.assertRaisesRegex(RuntimeError, "来源不完整"):
+                verify_child_artifacts(
+                    root, changed, 1, (42,), expected_source_hashes=frozen,
+                )
+
     def test_runtime_environment_records_actual_interpreter(self) -> None:
         runtime = runtime_environment()
         self.assertEqual(Path(runtime["python_executable"]), Path(sys.executable).resolve())

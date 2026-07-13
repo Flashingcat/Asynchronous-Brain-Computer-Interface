@@ -55,6 +55,18 @@ DEFAULT_POLICY_CONFIG = (
 )
 EXPECTED_INPUT_PROTOCOL = "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1"
 EXPECTED_OUTPUT_PROTOCOL = "bnci2014001_s01_s09_epoch50_causal_hard_vote_matrix_v1"
+# 历史正式输入绑定生成时源码，而不是要求它永远等于后续策略的当前源码。
+FROZEN_INPUT_MASTER_SOURCE_SHA256 = {
+    "multi_subject_runner": "37fa41eed2c9a8755510acb7e58d36f93b85f4827d8797de4a58027560ed5c1a",
+    "single_subject_runner": "8552a3d8295c6a4c6125ca9fc1fb6c98e29011fde163089d8e39b64f84c6cdfb",
+}
+FROZEN_INPUT_CHILD_SOURCE_SHA256 = {
+    "runner": "8552a3d8295c6a4c6125ca9fc1fb6c98e29011fde163089d8e39b64f84c6cdfb",
+    "protocol_metrics": "098e8db59ae9a396f8d32a22f1e05b6841272a850fe348196304efb9f212ad7e",
+    "oof_training_bundle_reader": "f5a2deb40b64187dcbbce34b5e4c382ebb637177851776713eb96c4e99e80f56",
+    "model_factory": "9e6b6af936f088cf0ed3cb25f52cf59d460159019b50beaf7b2b7b7c93173a60",
+    "eegnet": "73c97e1bae388ad599025c61cde27f4d451d12b3b83fa898232d6fe90d3fdaed",
+}
 EXPECTED_NPZ_FIELDS = {
     "window_rows", "stage1_logits", "stage2_logits",
     "stateless_emitted", "stateful_emitted", "stateful_before", "stateful_after",
@@ -144,10 +156,6 @@ def verify_input_root(input_root: Path) -> tuple[dict, dict[int, dict]]:
     master_path = input_root / "run_manifest.json"
     master = _read_json(master_path)
     master_log = _safe_artifact(input_root, master.get("run_log", {}).get("file", ""))
-    expected_master_sources = {
-        "multi_subject_runner": EVAL_DIR / "run_epoch50_online_oof_all_subjects.py",
-        "single_subject_runner": EVAL_DIR / "run_epoch50_online_oof.py",
-    }
     if (
         master.get("status") != "PASS"
         or master.get("claim_status") != "CLEAN_COMMIT_FORMAL_CANDIDATE"
@@ -159,10 +167,7 @@ def verify_input_root(input_root: Path) -> tuple[dict, dict[int, dict]]:
         or master.get("runtime_git", {}).get("dirty") is not False
         or not master_log.is_file()
         or file_hash(master_log) != master.get("run_log", {}).get("sha256")
-        or any(
-            master.get("source_sha256", {}).get(role) != file_hash(path)
-            for role, path in expected_master_sources.items()
-        )
+        or master.get("source_sha256") != FROZEN_INPUT_MASTER_SOURCE_SHA256
         or set(master.get("children", {})) != {str(subject) for subject in KNOWN_SUBJECTS}
     ):
         raise RuntimeError("输入九被试单窗正式候选清单不完整或与当前读取代码不兼容")
@@ -174,9 +179,19 @@ def verify_input_root(input_root: Path) -> tuple[dict, dict[int, dict]]:
         if not child_path.is_file() or file_hash(child_path) != record.get("manifest_sha256"):
             raise RuntimeError(f"Subject {subject} 输入子清单哈希不一致")
         child = _read_json(child_path)
-        if child.get("claim_status") != "CLEAN_COMMIT_FORMAL_CANDIDATE":
+        if (
+            child.get("claim_status") != "CLEAN_COMMIT_FORMAL_CANDIDATE"
+            or child.get("subject") != subject
+            or child.get("runtime", {}).get("git") != master.get("runtime_git")
+        ):
             raise RuntimeError(f"Subject {subject} 输入不是干净提交正式候选")
-        verify_child_artifacts(child_path.parent, child, subject, KNOWN_SEEDS)
+        verify_child_artifacts(
+            child_path.parent,
+            child,
+            subject,
+            KNOWN_SEEDS,
+            expected_source_hashes=FROZEN_INPUT_CHILD_SOURCE_SHA256,
+        )
         children[subject] = child
     return master, children
 

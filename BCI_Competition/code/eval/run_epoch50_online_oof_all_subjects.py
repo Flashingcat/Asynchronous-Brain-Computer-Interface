@@ -42,8 +42,10 @@ def verify_child_artifacts(
     manifest: dict,
     subject: int,
     seeds: tuple[int, ...],
+    *,
+    expected_source_hashes: dict[str, str] | None = None,
 ) -> None:
-    """在主清单签名前复核子清单、日志、checkpoint 网格和全部预测文件哈希。"""
+    """复核子清单；新运行绑定当前源码，历史消费者可传入冻结源码合同。"""
     expected_jobs = {
         (fold, seed, stage)
         for fold in range(6) for seed in seeds for stage in (1, 2)
@@ -65,11 +67,25 @@ def verify_child_artifacts(
         "model_factory": PROJECT_ROOT / "code" / "models" / "model_factory.py",
         "eegnet": PROJECT_ROOT / "code" / "models" / "models" / "eegnet.py",
     }
+    current_source_hashes = {
+        role: file_hash(path)
+        for role, path in expected_sources.items()
+    }
+    source_contract = (
+        current_source_hashes
+        if expected_source_hashes is None
+        else expected_source_hashes
+    )
+    if set(source_contract) != set(expected_sources) or any(
+        not isinstance(value, str) or len(value) != 64
+        for value in source_contract.values()
+    ):
+        raise RuntimeError(f"Subject {subject} 源码哈希合同不完整")
     source_hashes = manifest.get("source_sha256", {})
     if (
         actual_jobs != expected_jobs
         or len(records) != len(expected_jobs)
-        or any(source_hashes.get(role) != file_hash(path) for role, path in expected_sources.items())
+        or source_hashes != source_contract
         or any(
             record.get("validation_runs") != [record.get("fold")]
             or record.get("fold") in record.get("train_runs", [])
