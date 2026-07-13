@@ -368,6 +368,38 @@ READY -> TASK_CANDIDATE -> WAIT_IDLE -> READY
 
 除第 6.1 节的事件指标外，`stateful_candidate` 还必须报告候选打开次数及每有效分钟打开率、提交转化率、Stage 1 撤销率、超时率、segment 末未完成率，以及已完成候选区间的时长分布。提交、Stage 1 撤销、超时和未完成四项比例均以全部候选打开次数为分母，未完成候选也保留在该分母中；没有候选打开时比例记为 `null`。已完成候选时长从打开候选窗口的决策时刻量到提交、撤销或超时窗口的决策时刻，segment 末未完成候选不进入该时长分布。若一个 `MISS` 的合法事件窗口内出现候选超时，记录为“超时相关 MISS”；其比例以全部可评分 `MISS` 数为分母，没有可评分 `MISS` 时记为 `null`。该量只表示时间关联，不得表述为超时造成 MISS。真值仍只允许在完整推理轨迹生成后用于这些诊断统计。
 
+### 7.4 候选态 logit 策略诊断矩阵
+
+首个候选态分数矩阵固定复用第 7.1 节的 session 0 OOF logits，不重新训练，也不访问测试 session。参数是在查看同一 OOF logits 的无标签尺度分布后冻结的探索值，因此本矩阵只用于理解机制和提出下一轮工作点选择规则，不是无偏性能估计。八个 cell 必须全部报告，不得只保留结果较好的 cell。
+
+所有 cell 共享以下定义：
+
+- Stage 1 基础分数为 `sigmoid(task_logit-idle_logit)`；`ewma_probability` cell 是先转概率再做 EWMA，其余 EWMA cell 是先平滑二分类 margin 再转概率；
+- Stage 2 每窗 logits 先减去本窗四类均值，消除公共平移；均值和 EWMA 只聚合进入候选态后的窗口，开门窗不进入 Stage 2 历史；
+- Stage 1 的 EWMA、rolling 和差分在每个 segment 重置；Stage 2 历史还会在每次候选打开及提交、撤销、超时后清空；
+- EWMA 以首个可用分数初始化，rolling 在不足指定窗数时使用当前全部因果前缀，不做未来填充；
+- `task_on/task_hold/idle_reset` 的共同阈值为 `0.50/0.30/0.20`；打开、维持和提交使用 `>=`，IDLE 复位使用 `<=`；
+- 最大候选长度统一为开门后的 8 个窗口，即当前 0.5 秒步长下最多 4.0 秒；最后一窗仍先尝试提交，再判超时；
+- 默认 Stage 2 提交条件为聚合后 top-1 概率至少 `0.55` 且 top-1 与 top-2 概率差至少 `0.15`；高精度 cell 改为 `0.70/0.30`；
+- 类别稳定数按开门后连续的单窗 raw top-1 计算，并要求该类别等于当前聚合 top-1；二阶曲率固定使用最近三个候选窗各自的单窗 raw Stage 2 softmax 概率向量，计算其二阶差分 L2 范数，不使用均值或 EWMA 后的聚合概率，少于三窗时不能通过曲率条件；
+- Stage 1 突降撤销定义为过滤后 Task 概率差分 `<=-0.20`，即使同窗 Stage 2 已满足提交条件也由 Stage 1 撤销优先；
+- 所有阈值判断和时间变换只能使用当前及历史窗口；完整轨迹生成后才允许读取事件真值计算第 6.1、7.3 节指标。
+
+固定八个并列 cell：
+
+| cell | Stage 1 | Stage 2 候选内证据 | 最少候选窗 / 额外条件 |
+|---|---|---|---|
+| `raw_current` | 当前 margin | 当前中心化 logits | 1 |
+| `stage1_ewma` | margin EWMA，`alpha=0.5` | 当前中心化 logits | 1 |
+| `stage2_mean` | 当前 margin | 中心化 logits 均值 | 2 |
+| `dual_ewma` | margin EWMA，`alpha=0.5` | 中心化 logits EWMA，`alpha=0.5` | 2 |
+| `dual_ewma_drop_abort` | 同上，加 Task 概率突降撤销 | 中心化 logits EWMA | 2 |
+| `rolling_stable` | 最近 3 窗 margin 均值 | 中心化 logits 均值 | 3，raw 类别连续 2 窗稳定 |
+| `probability_curvature` | Task 概率 EWMA，加突降撤销 | 中心化 logits 均值 | 3，稳定 2 窗且概率曲率 `<=0.35` |
+| `dual_ewma_high_precision` | margin EWMA | 中心化 logits EWMA | 2，稳定 2 窗且采用 `0.70/0.30` 提交阈值 |
+
+每个 cell 除基础事件指标外，还须并列报告候选打开率、提交转化率、Stage 1 撤销率、超时率、未完成率、候选时长及超时相关 MISS。特征空间时间变化尚未进入本矩阵；只有先证明重新提取隐藏特征时的 logits 与冻结 logits 对齐，才能作为独立后续矩阵加入。
+
 ## 8. 复现与审计要求
 
 每次正式评估必须保存运行清单，至少记录：
@@ -392,8 +424,8 @@ READY -> TASK_CANDIDATE -> WAIT_IDLE -> READY
 
 以下内容仍必须通过独立轮次讨论、实现和审核：
 
-1. 多窗聚合位于 logits、概率、特征或独立时序模型中的具体方案及历史窗数；
-2. Stage 1/2 置信度阈值、连续确认规则与训练 session OOF 工作点选择；
+1. 隐藏特征空间的因果时间变化、归一化统计及与冻结 logits 的对齐验收；
+2. 如何从第 7.2、7.4 节描述性矩阵冻结 Stage 1/2 阈值、连续确认和最终工作点；
 3. `READY/TASK_CANDIDATE/WAIT_IDLE` 的具体门限、最大候选时长、复位条件、提前复位和复位延迟指标；
 4. epoch、随机种子、集成与多指标模型选择规则；
 5. 128 Hz 兼容预处理协议；

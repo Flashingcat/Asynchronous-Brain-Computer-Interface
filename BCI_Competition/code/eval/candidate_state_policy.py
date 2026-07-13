@@ -62,14 +62,79 @@ class CandidatePolicyResult:
     trace: tuple[CandidateTraceRecord, ...]
 
 
+@dataclass(frozen=True)
+class CandidateTransition:
+    """单窗纯状态转移结果，供分数策略和批量轨迹生成共享同一语义。"""
+
+    emitted_class: int
+    state_after: str
+    transition_reason: str | None
+    candidate_windows_after: int
+
+
+def _validate_max_candidate_windows(max_candidate_windows: int) -> None:
+    if type(max_candidate_windows) is not int or max_candidate_windows < 1:
+        raise ValueError("max_candidate_windows 必须为正整数")
+
+
+def candidate_transition(
+    state: str,
+    candidate_windows: int,
+    evidence: CandidateEvidence,
+    *,
+    max_candidate_windows: int,
+) -> CandidateTransition:
+    """执行一个窗口的固定优先级；不读取窗口、logit 或真值。"""
+    _validate_max_candidate_windows(max_candidate_windows)
+    if state not in (READY, TASK_CANDIDATE, WAIT_IDLE):
+        raise ValueError("state 必须是 READY、TASK_CANDIDATE 或 WAIT_IDLE")
+    if type(candidate_windows) is not int or candidate_windows < 0:
+        raise ValueError("candidate_windows 必须为非负整数")
+    if not isinstance(evidence, CandidateEvidence):
+        raise TypeError("evidence 必须为 CandidateEvidence")
+    if state != TASK_CANDIDATE and candidate_windows != 0:
+        raise ValueError("非候选态的 candidate_windows 必须为 0")
+    if state == TASK_CANDIDATE and candidate_windows >= max_candidate_windows:
+        raise ValueError("候选年龄不得在进入本窗前达到最大候选窗数")
+
+    emitted = NO_COMMAND
+    reason: str | None = None
+    age_after = candidate_windows
+    state_after = state
+    if state == READY:
+        if evidence.task_on:
+            state_after = TASK_CANDIDATE
+            reason = CANDIDATE_OPEN
+            age_after = 0
+    elif state == TASK_CANDIDATE:
+        age_after += 1
+        if not evidence.task_hold:
+            state_after = READY
+            reason = CANDIDATE_ABORT_STAGE1
+            age_after = 0
+        elif evidence.stage2_commit_class != NO_COMMAND:
+            emitted = evidence.stage2_commit_class
+            state_after = WAIT_IDLE
+            reason = COMMAND_COMMIT
+            age_after = 0
+        elif age_after >= max_candidate_windows:
+            state_after = READY
+            reason = CANDIDATE_TIMEOUT
+            age_after = 0
+    elif evidence.idle_reset:
+        state_after = READY
+        reason = IDLE_RESET
+
+    return CandidateTransition(emitted, state_after, reason, age_after)
+
+
 def _validate_inputs(
     windows: Sequence[ExpectedWindow],
     evidence: Sequence[CandidateEvidence],
     max_candidate_windows: int,
 ) -> None:
     """拒绝错位、乱序或隐式类型转换，正式策略必须逐窗消费完整母索引。"""
-    if type(max_candidate_windows) is not int or max_candidate_windows < 1:
-        raise ValueError("max_candidate_windows 必须为正整数")
+    _validate_max_candidate_windows(max_candidate_windows)
     if len(windows) != len(evidence):
         raise ValueError("证据数量必须与窗口数量完全一致")
     if any(not isinstance(window, ExpectedWindow) for window in windows):
@@ -136,42 +201,24 @@ def candidate_state_decisions(
 
         before = state
         age_before = candidate_windows
-        emitted = NO_COMMAND
-        reason: str | None = None
-
-        if state == READY:
-            if item.task_on:
-                state = TASK_CANDIDATE
-                reason = CANDIDATE_OPEN
-                candidate_windows = 0
-        elif state == TASK_CANDIDATE:
-            candidate_windows += 1
-            if not item.task_hold:
-                state = READY
-                reason = CANDIDATE_ABORT_STAGE1
-                candidate_windows = 0
-            elif item.stage2_commit_class != NO_COMMAND:
-                emitted = item.stage2_commit_class
-                state = WAIT_IDLE
-                reason = COMMAND_COMMIT
-                candidate_windows = 0
-            elif candidate_windows >= max_candidate_windows:
-                state = READY
-                reason = CANDIDATE_TIMEOUT
-                candidate_windows = 0
-        elif item.idle_reset:
-            state = READY
-            reason = IDLE_RESET
+        transition = candidate_transition(
+            state,
+            candidate_windows,
+            item,
+            max_candidate_windows=max_candidate_windows,
+        )
+        state = transition.state_after
+        candidate_windows = transition.candidate_windows_after
 
         decision = DecisionRecord(
             *window.key,
             window.window_index,
             window.window_start_sample,
             window.window_stop_sample,
-            emitted,
+            transition.emitted_class,
             before,
             state,
-            reason,
+            transition.transition_reason,
         )
         decisions.append(decision)
         traces.append(CandidateTraceRecord(

@@ -219,8 +219,36 @@ python BCI_Competition/code/eval/run_hard_vote_matrix.py `
 
 ### 6.5 可撤销候选态内核
 
-候选态内核新增 `READY/TASK_CANDIDATE/WAIT_IDLE` 三状态策略，把 Stage 1 开门与维持、Stage 2 四分类提交、输出后的重复触发锁定分别处理。当前实现只消费调用方已经因果计算好的 `task_on`、`task_hold`、`stage2_commit_class`、`idle_reset`，因此尚未选择任何分数变换、EWMA 系数、阈值或最大候选窗数，也没有产生新的九被试 OOF 结果。
+在提交 `6c3849d` 的候选态内核轮次，新增 `READY/TASK_CANDIDATE/WAIT_IDLE` 三状态策略，把 Stage 1 开门与维持、Stage 2 四分类提交、输出后的重复触发锁定分别处理。该层只消费调用方已经因果计算好的 `task_on`、`task_hold`、`stage2_commit_class`、`idle_reset`；在该轮结束时尚未选择任何分数变换、EWMA 系数、阈值或最大候选窗数，也没有产生新的九被试 OOF 候选策略结果。
 
-本轮只用可手算轨迹冻结转换语义和候选诊断指标。下一步必须先分别定义 Stage 1 和 Stage 2 的证据生成规则，再在训练 session OOF 上完整报告候选打开、撤销、超时、提交、事件正确率、误指令和延迟；不得把单元测试中的候选窗数当作正式超参数。
+该内核轮只用可手算轨迹冻结转换语义和候选诊断指标，并要求后续策略分别定义 Stage 1 和 Stage 2 的证据生成规则，再在训练 session OOF 上完整报告候选打开、撤销、超时、提交、事件正确率、误指令和延迟；不得把单元测试中的候选窗数当作正式超参数。首批 logit 证据策略和描述性结果现见 6.6 节，但不改变 6.5 节只描述底层状态合同的范围。
 
 为允许后续策略安全复用 6.3 节的冻结 logits，历史输入验证改为核对 `ba35de6` 运行自身的固定 master/child 源码哈希合同和全部产物哈希，而不是要求历史生成源码等于当前已扩展的评估器源码。新运行仍默认绑定当前源码。最终有效兼容回归目录为 `results/tables/hard_vote_candidate_mode_compat_precommit_v3`；其中 27 个轨迹 NPZ、27 个指标 JSON 和两份汇总 CSV 与 `cc2e026` 干净结果均字节级一致。该回归只证明旧策略未被改变，不构成新的性能实验。
+
+### 6.6 候选态 logit 策略诊断矩阵
+
+本轮不重新训练，而是从 6.3 节冻结的 session 0 OOF logits 构造第 7.4 节八种候选策略。最终有效预提交运行命令为：
+
+```powershell
+python BCI_Competition/code/eval/run_candidate_logit_matrix.py `
+  --input-root BCI_Competition/results/tables/s01_s09_epoch50_causal_single_window_oof_clean_ba35de6_v2 `
+  --output-root BCI_Competition/results/tables/s01_s09_epoch50_causal_candidate_logit_matrix_precommit_v2
+```
+
+运行状态为 `PRECOMMIT_DIAGNOSTIC_MATRIX`，Subject 1–9、seed 42/43/44 全部完成，只加载 session 0。九被试在每个 seed 内等权宏平均，再对三个配对 seed 求均值的主要结果如下；单窗两状态基线仅作为已有参考，不属于八个候选 cell：
+
+| 策略 | 正确事件率 | 事件触发率 | 触发后分类准确率 | IDLE 误指令/分钟 | 正确事件平均延迟/s |
+|---|---:|---:|---:|---:|---:|
+| 单窗两状态参考 | 0.2257 | 0.5804 | 0.3880 | 7.048 | 1.724 |
+| `raw_current` | 0.2739 | 0.5082 | 0.5238 | 1.821 | 2.067 |
+| `stage1_ewma` | 0.2790 | 0.4561 | 0.5810 | 1.357 | 2.291 |
+| `stage2_mean` | 0.2579 | 0.4171 | 0.5922 | 1.294 | 2.341 |
+| `dual_ewma` | 0.2833 | 0.4073 | 0.6515 | 1.184 | 2.582 |
+| `dual_ewma_drop_abort` | 0.2816 | 0.4037 | 0.6545 | 1.085 | 2.589 |
+| `rolling_stable` | 0.2604 | 0.3370 | 0.7138 | 1.219 | 2.840 |
+| `probability_curvature` | 0.2206 | 0.2830 | 0.7063 | 1.085 | 2.840 |
+| `dual_ewma_high_precision` | 0.2299 | 0.2904 | 0.7597 | 1.161 | 2.811 |
+
+结果验证了三类预期取舍，但不能据此挑选最终策略。相对直接单窗参考，候选态普遍大幅降低 IDLE 误指令并提高触发后的四分类纯度，代价是触发率下降和延迟增加；`dual_ewma_drop_abort` 相比 `dual_ewma` 进一步降低误指令，但正确事件率也略降；稳定性、曲率和高精度条件继续提高已触发事件的类别准确率，同时产生更多 MISS。表中数值来自用于探索参数的同一 OOF 矩阵，因此只能描述机制，不能把数值最高的 cell 称为无偏“最优工作点”。
+
+运行器另存了不读取标签或事件的 111,060 个模型-窗口分数尺度摘要：Stage 1 Task 概率中位数为 0.6708，Stage 2 top-1 概率中位数为 0.5463；segment 内一阶差分有 110,325 项，二阶差分有 109,590 项。每个 seed 的 NPZ 逐策略保存分数、差分、曲率、四项证据、候选年龄、状态和输出，JSON 保存完整事件及候选诊断指标。`precommit_v1` 生成后又补强了计数 dtype、源码闭包和运行身份冻结，已由 v2 取代，不得作为最终证据目录。
