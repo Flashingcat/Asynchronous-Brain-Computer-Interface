@@ -300,6 +300,22 @@ WAIT_IDLE -> 已触发 MI，禁止重复输出，等待确认 IDLE
 - 状态转换参数必须由训练 session 的验证数据确定；
 - 无状态结果与加入离散先验的结果必须分开报告。
 
+### 7.1 固定 epoch 50 单窗基线
+
+为给后续多窗聚合和置信度策略提供最低对照，首个在线 OOF 基线固定复用已完成训练的因果 EEGNet，不重新训练：
+
+- `training_budget_epochs=50`、`checkpoint_epoch=50`、`checkpoint_rule=fixed_final_epoch`；
+- `epoch_selection_method=none`、`selection_metric=null`；这里的 epoch 50 是预先固定训练预算的最终 checkpoint，不是比较 1–50 epoch 后选出的最佳 epoch；
+- 仅使用训练 session 的六折 OOF：第 `k` 个完整 run 只能由未使用该 run 训练的 fold `k` checkpoint 推理；Stage 1/2 必须使用相同 fold、seed 和因果训练域配对；
+- 每个连续窗口同时计算 Stage 1 和 Stage 2 logit，不使用置信度阈值或多窗聚合；Stage 1 单窗 `argmax=Task` 时，类别取同一窗口 Stage 2 argmax；
+- Stage 1 logit 完全相等时按固定类别顺序判为 `IDLE`；Stage 2 完全相等时取固定顺序中的第一类；
+- 无状态诊断在每个 Stage 1 Task 窗都输出一次类别；离散基线在 `READY` 的 Task 窗输出一次并进入 `WAIT_IDLE`，在首个 Stage 1 IDLE 窗只执行复位，从下一窗口起才重新允许输出；
+- 每个 segment 均从 `READY` 独立开始，不跨 segment 继承状态；
+- 三个 seed 分别报告，再计算描述性均值和总体标准差，不进行 seed 集成或按结果选择 seed；
+- 运行器必须先用 checkpoint 重算原训练验证窗口，并与已保存的 epoch 50 OOF logit 核对，再对完整连续窗口推理；两类 logit 和两种决策轨迹均须保存。
+
+该规则只定义“无聚合、无阈值”的基线，不冻结最终系统的复位条件、epoch 选择或模型选择。测试 session 在这些项目全部冻结前继续封存。
+
 0.5 秒事件匹配 margin 已在本轮冻结。具体分数聚合方式、置信度阈值、连续确认窗口数和 `WAIT_IDLE` 复位条件在后续轮次确定，并与检测延迟共同报告。
 
 ## 8. 复现与审计要求
