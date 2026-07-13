@@ -400,6 +400,36 @@ READY -> TASK_CANDIDATE -> WAIT_IDLE -> READY
 
 每个 cell 除基础事件指标外，还须并列报告候选打开率、提交转化率、Stage 1 撤销率、超时率、未完成率、候选时长及超时相关 MISS。特征空间时间变化尚未进入本矩阵；只有先证明重新提取隐藏特征时的 logits 与冻结 logits 对齐，才能作为独立后续矩阵加入。
 
+### 7.5 隐藏特征时间变化机制 pilot
+
+在提交 `8737c75` 的提取预检中，Subject 1、seed 42 的 12 个 epoch 50 checkpoint 已重新执行 Stage 1/2 推理。EEGNet `block2` 展平后的 240 维分类头前特征、底层 `return_features` logit、`LogitAdapter` logit、训练时保存的验证 OOF logit和第 7.1 节冻结的连续 logit 已逐元素对齐。该预检只加载 session 0，未生成决策或选择参数。
+
+首批特征策略仅作为 S1/seed42 机制 pilot，不构成九被试矩阵或正式工作点。所有 cell 复用第 7.4 节的 `dual_ewma_drop_abort` 作为 logit 骨架；特征证据只能否决本来已经满足的 Stage 2 提交，不能打开候选、改变 Stage 1 的维持/撤销证据，也不能覆盖同窗 Stage 1 撤销的更高优先级。
+
+- 特征固定取 Stage 2 EEGNet 分类头之前的 240 维向量；Stage 1/2 和不同 fold 的特征坐标系分别独立，不得直接互算距离；
+- 当前 pilot 只在同一 Stage、同一 run、同一连续 segment 内计算时间变化；每窗特征先独立做 L2 归一化，避免原始范数直接支配距离；
+- 开门窗口不进入特征历史；当前候选窗先与截至上一窗的历史比较，再写入历史；提交、撤销、超时和 segment 边界均清空历史；
+- `unit_velocity_l2` 是当前单位向量与上一候选窗单位向量的 L2 距离；第一候选窗不可用；
+- `unit_prototype_cosine_distance` 是当前单位向量与此前候选单位向量和的方向之间的余弦距离；第一候选窗不可用；
+- `unit_acceleration_l2` 是最近三个候选单位向量二阶差分的 L2 范数；少于三个候选窗时不可用；
+- 变化值使用 `<=` 通过，连续门控只累计特征条件连续通过次数，不要求此前各窗同时满足 logit 提交条件；
+- 线性分类头满足“特征均值后分类等于 logits 均值”，因此本 pilot 不把特征均值伪装成独立策略，只检查 logits 未直接表达的轨迹变化。
+
+固定八个并列 cell：
+
+| cell | 特征条件 | 连续通过窗数 |
+|---|---|---:|
+| `logit_only_reference` | 无 | 0 |
+| `velocity_loose` | 单位特征速度 `<=1.2` | 1 |
+| `velocity_strict` | 单位特征速度 `<=0.9` | 1 |
+| `velocity_consecutive` | 单位特征速度 `<=1.2` | 2 |
+| `prototype_loose` | 候选原型余弦距离 `<=0.7` | 1 |
+| `prototype_strict` | 候选原型余弦距离 `<=0.4` | 1 |
+| `acceleration_loose` | 单位特征二阶变化 `<=2.0` | 1 |
+| `acceleration_strict` | 单位特征二阶变化 `<=1.5` | 1 |
+
+阈值是在查看同一 S1/seed42 OOF 的无标签候选局部尺度后冻结的探索值，八个 cell 必须完整报告。该 pilot 可以决定某种机制是否值得扩展，但不能用其中数值选择一个 cell 后声称得到无偏验证结果；任何九被试扩展、阈值选择或 Stage 1 特征/OOD 门控必须另立协议。
+
 ## 8. 复现与审计要求
 
 每次正式评估必须保存运行清单，至少记录：
@@ -424,7 +454,7 @@ READY -> TASK_CANDIDATE -> WAIT_IDLE -> READY
 
 以下内容仍必须通过独立轮次讨论、实现和审核：
 
-1. 隐藏特征空间的因果时间变化、归一化统计及与冻结 logits 的对齐验收；
+1. 是否把第 7.5 节特征门控扩展至九被试，以及只由训练数据确定阈值的规则；
 2. 如何从第 7.2、7.4 节描述性矩阵冻结 Stage 1/2 阈值、连续确认和最终工作点；
 3. `READY/TASK_CANDIDATE/WAIT_IDLE` 的具体门限、最大候选时长、复位条件、提前复位和复位延迟指标；
 4. epoch、随机种子、集成与多指标模型选择规则；
