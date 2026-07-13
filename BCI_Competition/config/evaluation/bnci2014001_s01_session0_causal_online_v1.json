@@ -21,6 +21,8 @@
   "inventory": {
     "segment_count": 21,
     "segment_inventory_sha256": "d228d16c128df2f8b0927fb351dffbbd40c2d4bc5e5a0c813961172730eca7dc",
+    "fully_warmup_excluded_segment_count": 0,
+    "fully_warmup_excluded_samples": 0,
     "zero_window_segment_count": 3,
     "zero_window_segment_samples": 624,
     "trailing_unwindowed_samples": 786,

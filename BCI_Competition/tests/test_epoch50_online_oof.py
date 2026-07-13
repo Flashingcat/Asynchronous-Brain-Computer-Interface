@@ -26,6 +26,7 @@ from protocol_metrics import (  # noqa: E402
 )
 from run_epoch50_online_oof import (  # noqa: E402
     build_online_inventory,
+    default_subject_paths,
     output_window_rows,
     stateful_argmax_decisions,
     stateless_argmax_decisions,
@@ -41,13 +42,14 @@ WINDOW_DTYPE = np.dtype([
 ])
 
 
-def fake_context() -> SimpleNamespace:
+def fake_context(subject: int = 1) -> SimpleNamespace:
     """构造一个不含测试 session、只含一个干净 MI 事件的最小 bundle。"""
     rows = np.zeros(5, dtype=WINDOW_DTYPE)
     for index, start in enumerate(range(500, 1125, 125)):
-        rows[index] = (1, 0, 0, 0, index, start, start + 500, 7, 3, 1, 2, True)
+        rows[index] = (subject, 0, 0, 0, index, start, start + 500, 7, 3, 1, 2, True)
     manifest = {
-        "subject": 1,
+        "protocol_id": f"bnci2014001_s{subject:02d}_oof_train_session0_native250_v1",
+        "subject": subject,
         "included_session": 0,
         "test_session_content_in_bundle": False,
         "index_sha256": "b" * 64,
@@ -78,6 +80,40 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue(np.all(inventory.signal_rows["trial"] == -1))
         self.assertTrue(np.all(inventory.signal_rows["stage2_label"] == -1))
 
+    def test_subject9_uses_its_own_identity_and_paths(self) -> None:
+        inventory = build_online_inventory(fake_context(subject=9))
+        self.assertTrue(all(item.subject_id == 9 for item in inventory.segments))
+        self.assertTrue(all(item.subject_id == 9 for item in inventory.events))
+        self.assertTrue(all(item.subject_id == 9 for item in inventory.windows))
+        self.assertTrue(np.all(inventory.signal_rows["subject"] == 9))
+
+        paths = default_subject_paths(9)
+        self.assertIn("s09_oof_train_session0", str(paths.bundle_manifest))
+        self.assertIn("extension_s09", str(paths.checkpoint_root))
+        self.assertIn("s09_session0_causal_online", str(paths.inventory_contract))
+
+    def test_fully_warmup_excluded_segment_is_counted_not_scored(self) -> None:
+        context = fake_context()
+        context.rows["segment"] = 1
+        context.manifest["domains"]["causal"]["segments"] = [
+            {
+                "session": 0, "run": 0, "segment": 0,
+                "start_native": 0, "stop_native": 250,
+                "formal_start_native": 250, "formal_stop_native": 250,
+            },
+            {
+                "session": 0, "run": 0, "segment": 1,
+                "start_native": 250, "stop_native": 2000,
+                "formal_start_native": 250, "formal_stop_native": 2000,
+            },
+        ]
+        inventory = build_online_inventory(context)
+        self.assertEqual(len(inventory.segments), 1)
+        self.assertEqual(inventory.segments[0].segment_id, 1)
+        self.assertEqual(inventory.fully_warmup_excluded_segment_count, 1)
+        self.assertEqual(inventory.fully_warmup_excluded_samples, 250)
+        self.assertTrue(all(event.segment_id == 1 for event in inventory.events))
+
     def test_frozen_contract_detects_inventory_change(self) -> None:
         context = fake_context()
         inventory = build_online_inventory(context)
@@ -97,13 +133,20 @@ class InventoryTests(unittest.TestCase):
             "subject": 1,
             "included_session": 0,
             "test_session_access": "forbidden",
+            "native_sampling_rate": 250,
+            "window_samples": 500,
+            "step_samples": 125,
+            "event_margin_samples": 125,
             "source_bundle": {
+                "protocol_id": context.manifest["protocol_id"],
                 "manifest_sha256": context.manifest_sha256,
                 "index_sha256": context.manifest["index_sha256"],
             },
             "inventory": {
                 "segment_count": baseline["scoring_segment_count"],
                 "segment_inventory_sha256": baseline["scoring_segment_inventory_sha256"],
+                "fully_warmup_excluded_segment_count": 0,
+                "fully_warmup_excluded_samples": 0,
                 "zero_window_segment_count": baseline["zero_window_segment_count"],
                 "zero_window_segment_samples": baseline["zero_window_segment_samples"],
                 "trailing_unwindowed_samples": baseline["trailing_unwindowed_samples"],
@@ -182,10 +225,17 @@ class SingleWindowPolicyTests(unittest.TestCase):
         rows = output_window_rows(self.windows())
         self.assertEqual(rows.dtype.names, (
             "subject_id", "session_id", "run_id", "segment_id", "window_index",
-            "window_start_sample", "window_stop_sample", "decision_time_seconds",
+            "window_start_native", "window_stop_native",
+            "window_start_model", "window_stop_model", "decision_time_seconds",
         ))
         np.testing.assert_array_equal(
-            rows["decision_time_seconds"], rows["window_stop_sample"] / 250.0,
+            rows["window_start_native"], rows["window_start_model"],
+        )
+        np.testing.assert_array_equal(
+            rows["window_stop_native"], rows["window_stop_model"],
+        )
+        np.testing.assert_array_equal(
+            rows["decision_time_seconds"], rows["window_stop_native"] / 250.0,
         )
 
 

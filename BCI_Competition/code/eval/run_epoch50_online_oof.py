@@ -1,4 +1,4 @@
-"""使用固定 epoch 50 EEGNet checkpoint 运行 Subject 1 的因果 OOF 在线基线。"""
+"""使用固定 epoch 50 EEGNet checkpoint 运行单被试因果 OOF 在线基线。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,12 @@ for source_dir in (TRAIN_DIR, MODELS_DIR, EVAL_DIR):
         sys.path.insert(0, str(source_dir))
 
 from model_factory import build_model  # noqa: E402
-from oof_training_bundle import BundleContext, load_bundle  # noqa: E402
+from oof_training_bundle import (  # noqa: E402
+    BundleContext,
+    load_bundle,
+    rows_for,
+    window_identity_hash,
+)
 from protocol_metrics import (  # noqa: E402
     NATIVE_SAMPLING_RATE,
     NO_COMMAND,
@@ -51,23 +56,12 @@ FIXED_EPOCH = 50
 INFERENCE_BATCH_SIZE = 256
 FIXED_FOLDS = tuple(range(6))
 KNOWN_SEEDS = (42, 43, 44)
-DEFAULT_BUNDLE = (
-    PROJECT_ROOT / "data" / "processed"
-    / "bnci2014001_s01_oof_train_session0_native250_v1" / "manifest.json"
-)
-DEFAULT_CHECKPOINT_ROOT = PROJECT_ROOT / "results" / "checkpoints" / "eegnet_oof_native250_v1"
-DEFAULT_INVENTORY_CONTRACT = (
-    PROJECT_ROOT / "config" / "evaluation"
-    / "bnci2014001_s01_session0_causal_online_v1.json"
-)
-DEFAULT_OUTPUT_ROOT = (
-    PROJECT_ROOT / "results" / "tables"
-    / "s01_epoch50_causal_single_window_oof_v1"
-)
+KNOWN_SUBJECTS = tuple(range(1, 10))
 OUTPUT_WINDOW_DTYPE = np.dtype([
     ("subject_id", "u1"), ("session_id", "u1"), ("run_id", "u1"),
     ("segment_id", "u1"), ("window_index", "<u4"),
-    ("window_start_sample", "<i8"), ("window_stop_sample", "<i8"),
+    ("window_start_native", "<i8"), ("window_stop_native", "<i8"),
+    ("window_start_model", "<i8"), ("window_stop_model", "<i8"),
     ("decision_time_seconds", "<f8"),
 ])
 
@@ -80,6 +74,44 @@ class OnlineInventory:
     events: list[MIEvent]
     windows: list[ExpectedWindow]
     signal_rows: np.ndarray
+    fully_warmup_excluded_segment_count: int
+    fully_warmup_excluded_samples: int
+
+
+@dataclass(frozen=True)
+class SubjectPaths:
+    """单被试运行的四类输入/输出路径，集中定义以避免各入口命名漂移。"""
+
+    bundle_manifest: Path
+    checkpoint_root: Path
+    inventory_contract: Path
+    output_root: Path
+
+
+def default_subject_paths(subject: int) -> SubjectPaths:
+    """按被试编号解析已冻结 bundle、训练矩阵、库存合同和默认结果目录。"""
+    if type(subject) is not int or subject not in KNOWN_SUBJECTS:
+        raise ValueError(f"subject 只能取 {KNOWN_SUBJECTS}")
+    checkpoint_name = (
+        "eegnet_oof_native250_v1" if subject == 1
+        else f"eegnet_oof_extension_s{subject:02d}_native250_v1"
+    )
+    return SubjectPaths(
+        bundle_manifest=(
+            PROJECT_ROOT / "data" / "processed"
+            / f"bnci2014001_s{subject:02d}_oof_train_session0_native250_v1"
+            / "manifest.json"
+        ),
+        checkpoint_root=PROJECT_ROOT / "results" / "checkpoints" / checkpoint_name,
+        inventory_contract=(
+            PROJECT_ROOT / "config" / "evaluation"
+            / f"bnci2014001_s{subject:02d}_session0_causal_online_v1.json"
+        ),
+        output_root=(
+            PROJECT_ROOT / "results" / "tables"
+            / f"s{subject:02d}_epoch50_causal_single_window_oof_v1"
+        ),
+    )
 
 
 # ---------- 通用审计工具：所有外部输入和输出均以 SHA-256 绑定 ----------
@@ -143,8 +175,9 @@ def git_state() -> dict:
 
 
 def verify_model_sources(checkpoint_root: Path, contract: dict) -> str:
-    """优先要求训练字节完全一致；换行不同则由 post-hoc snapshot 证明内容等价。"""
+    """核对推理模型和实际 bundle reader；换行差异须由覆盖该矩阵的快照证明。"""
     source_paths = {
+        "oof_training_bundle_reader": TRAIN_DIR / "oof_training_bundle.py",
         "model_factory": MODELS_DIR / "model_factory.py",
         "eegnet": MODELS_DIR / "models" / "eegnet.py",
     }
@@ -152,13 +185,25 @@ def verify_model_sources(checkpoint_root: Path, contract: dict) -> str:
     if all(file_hash(path) == expected.get(role) for role, path in source_paths.items()):
         return "exact_training_bytes"
 
-    snapshot_root = checkpoint_root / "posthoc_source_snapshot"
-    snapshot_manifest_path = snapshot_root / "manifest.json"
-    if not snapshot_manifest_path.is_file():
+    candidates = (
+        checkpoint_root / "posthoc_source_snapshot",
+        PROJECT_ROOT / "results" / "checkpoints"
+        / "eegnet_oof_native250_v1" / "posthoc_source_snapshot",
+    )
+    snapshot_root = next(
+        (candidate for candidate in candidates if (candidate / "manifest.json").is_file()),
+        None,
+    )
+    if snapshot_root is None:
         raise RuntimeError("模型源码字节不同且缺少 post-hoc source snapshot")
+    snapshot_manifest_path = snapshot_root / "manifest.json"
     snapshot = json.loads(snapshot_manifest_path.read_text(encoding="utf-8"))
     records = {item["role"]: item for item in snapshot.get("source_files", [])}
-    if snapshot.get("status") != "PASS_WITH_DISCLOSED_EOL_NORMALIZATION":
+    covered_roots = snapshot.get("job_config_audit", {}).get("covered_result_roots", [])
+    if (
+        snapshot.get("status") != "PASS_WITH_DISCLOSED_EOL_NORMALIZATION"
+        or checkpoint_root.name not in covered_roots
+    ):
         raise RuntimeError("post-hoc source snapshot 状态非法")
     for role, path in source_paths.items():
         record = records.get(role, {})
@@ -176,24 +221,46 @@ def verify_model_sources(checkpoint_root: Path, contract: dict) -> str:
 # ---------- 冻结库存：只从 session0-only bundle 派生，不读取联合索引或测试 session ----------
 def build_online_inventory(context: BundleContext) -> OnlineInventory:
     manifest = context.manifest
+    subject = manifest.get("subject")
     if (
-        manifest.get("subject") != 1
+        type(subject) is not int
+        or subject not in KNOWN_SUBJECTS
         or manifest.get("included_session") != 0
         or manifest.get("test_session_content_in_bundle") is not False
+        or np.any(context.rows["subject"] != subject)
         or np.any(context.rows["session"] != 0)
     ):
-        raise RuntimeError("在线 OOF runner 只允许 Subject 1、session 0-only bundle")
+        raise RuntimeError("在线 OOF runner 只允许 Subject 1–9 的 session 0-only bundle")
 
-    records = sorted(
+    all_records = sorted(
         manifest["domains"]["causal"]["segments"],
         key=lambda item: (item["run"], item["segment"]),
     )
-    if any(record["session"] != 0 for record in records):
+    if any(record["session"] != 0 for record in all_records):
         raise RuntimeError("因果信号清单意外包含测试 session")
+
+    # 某些被试的 run 起点恰好被伪迹切出不足或等于 1 秒的短段；该段会被因果
+    # warmup 完整排除。它不属于有效评分时间，但必须单独计数，不能静默消失。
+    empty_records = [
+        record for record in all_records
+        if record["formal_start_native"] == record["formal_stop_native"]
+    ]
+    if any(
+        record["formal_start_native"] > record["formal_stop_native"]
+        or record["formal_stop_native"] != record["stop_native"]
+        or not 0 < record["stop_native"] - record["start_native"] <= NATIVE_SAMPLING_RATE
+        for record in all_records
+        if record["formal_start_native"] >= record["formal_stop_native"]
+    ):
+        raise RuntimeError("因果 segment 的正式区间非法，不能解释为完整 warmup 排除")
+    records = [
+        record for record in all_records
+        if record["formal_start_native"] < record["formal_stop_native"]
+    ]
 
     segments = [
         ScoringSegment(
-            1, 0, record["run"], record["segment"],
+            subject, 0, record["run"], record["segment"],
             record["formal_start_native"], record["formal_stop_native"],
         )
         for record in records
@@ -231,7 +298,7 @@ def build_online_inventory(context: BundleContext) -> OnlineInventory:
         ):
             raise RuntimeError("session0 task 行不能唯一恢复冻结 MI 事件")
         events.append(MIEvent(
-            f"s0_r{run}_t{trial}", 1, 0, run, segment,
+            f"s0_r{run}_t{trial}", subject, 0, run, segment,
             int(rows["start"].min()), int(rows["stop"].max()), labels.pop() + 1,
         ))
 
@@ -247,7 +314,14 @@ def build_online_inventory(context: BundleContext) -> OnlineInventory:
         signal_rows[index]["window"] = window.window_index
         signal_rows[index]["start"] = window.window_start_sample
         signal_rows[index]["stop"] = window.window_stop_sample
-    return OnlineInventory(segments, events, windows, signal_rows)
+    return OnlineInventory(
+        segments,
+        events,
+        windows,
+        signal_rows,
+        len(empty_records),
+        sum(record["stop_native"] - record["start_native"] for record in empty_records),
+    )
 
 
 def verify_inventory_contract(
@@ -256,11 +330,19 @@ def verify_inventory_contract(
     contract: dict,
 ) -> dict:
     """用全 NO_COMMAND 轨迹计算可信库存哈希；缺事件或缺窗口会在正式推理前失败。"""
+    subject = context.manifest["subject"]
     if (
-        contract.get("protocol_id") != "bnci2014001_s01_session0_causal_online_v1"
-        or contract.get("subject") != 1
+        contract.get("protocol_id")
+        != f"bnci2014001_s{subject:02d}_session0_causal_online_v1"
+        or contract.get("subject") != subject
         or contract.get("included_session") != 0
         or contract.get("test_session_access") != "forbidden"
+        or contract.get("native_sampling_rate") != NATIVE_SAMPLING_RATE
+        or contract.get("window_samples") != 500
+        or contract.get("step_samples") != 125
+        or contract.get("event_margin_samples") != 125
+        or contract.get("source_bundle", {}).get("protocol_id")
+        != context.manifest.get("protocol_id")
         or contract.get("source_bundle", {}).get("manifest_sha256") != context.manifest_sha256
         or contract.get("source_bundle", {}).get("index_sha256") != context.manifest["index_sha256"]
     ):
@@ -281,6 +363,8 @@ def verify_inventory_contract(
     actual = {
         "segment_count": result["scoring_segment_count"],
         "segment_inventory_sha256": result["scoring_segment_inventory_sha256"],
+        "fully_warmup_excluded_segment_count": inventory.fully_warmup_excluded_segment_count,
+        "fully_warmup_excluded_samples": inventory.fully_warmup_excluded_samples,
         "zero_window_segment_count": result["zero_window_segment_count"],
         "zero_window_segment_samples": result["zero_window_segment_samples"],
         "trailing_unwindowed_samples": result["trailing_unwindowed_samples"],
@@ -313,7 +397,13 @@ def verify_inventory_contract(
 
 # ---------- 输入物化：每个 fold 只使用另外 5 个 run 拟合出的因果统计量 ----------
 def materialize_rows(context: BundleContext, rows: np.ndarray, fold: int) -> np.ndarray:
-    if len(rows) == 0 or np.any(rows["session"] != 0) or set(rows["run"].tolist()) != {fold}:
+    subject = context.manifest["subject"]
+    if (
+        len(rows) == 0
+        or np.any(rows["subject"] != subject)
+        or np.any(rows["session"] != 0)
+        or set(rows["run"].tolist()) != {fold}
+    ):
         raise RuntimeError("物化窗口必须是单个 held-out session0 run")
     entry = context.manifest["folds"][fold]
     if entry["fold"] != fold or entry["validation_runs"] != [fold] or fold in entry["train_runs"]:
@@ -377,10 +467,15 @@ def load_epoch50_job(
     completed = json.loads(completed_path.read_text(encoding="utf-8"))
     contract = config.get("contract", {})
     classes = 2 if stage == 1 else 4
+    subject = context.manifest["subject"]
     expected_job = {
-        "subject": 1, "fold": fold, "stage": stage,
+        "subject": subject, "fold": fold, "stage": stage,
         "train_domain": "causal", "seed": seed,
     }
+    fold_contract = context.manifest["folds"][fold]
+    data_contract = contract.get("data", {})
+    train_identity = fold_contract[f"train_stage{stage}"]
+    validation_identity = fold_contract[f"validation_stage{stage}"]
     if (
         config.get("contract_sha256") != canonical_hash(contract)
         or contract.get("job") != expected_job
@@ -388,9 +483,15 @@ def load_epoch50_job(
         or contract.get("model", {}).get("classes")
         != (["idle", "task"] if stage == 1 else ["left_hand", "right_hand", "feet", "tongue"])
         or contract.get("validation_domains") != ["causal"]
-        or contract.get("data", {}).get("session") != 0
-        or contract.get("data", {}).get("validation_runs") != [fold]
-        or contract.get("data", {}).get("training_bundle_manifest_sha256") != context.manifest_sha256
+        or data_contract.get("session") != 0
+        or data_contract.get("train_runs") != fold_contract["train_runs"]
+        or data_contract.get("validation_runs") != fold_contract["validation_runs"]
+        or data_contract.get("train_window_count") != train_identity["window_count"]
+        or data_contract.get("train_window_sha256") != train_identity["window_sha256"]
+        or data_contract.get("validation_window_count") != validation_identity["window_count"]
+        or data_contract.get("validation_window_sha256") != validation_identity["window_sha256"]
+        or data_contract.get("training_bundle_protocol_id") != context.manifest["protocol_id"]
+        or data_contract.get("training_bundle_manifest_sha256") != context.manifest_sha256
         or contract.get("test_session_access") != "forbidden"
     ):
         raise RuntimeError(f"{job_name} 训练合同不是固定 epoch50 因果 OOF 作业")
@@ -427,19 +528,44 @@ def load_epoch50_job(
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()
 
+    expected_train_rows = rows_for(context.manifest, context.rows, fold, stage, "train")
+    expected_validation_rows = rows_for(
+        context.manifest, context.rows, fold, stage, "validation",
+    )
+    if (
+        len(expected_train_rows) != data_contract["train_window_count"]
+        or window_identity_hash(expected_train_rows) != data_contract["train_window_sha256"]
+    ):
+        raise RuntimeError(f"{job_name} 训练窗口不能从冻结 bundle 唯一恢复")
+
     with np.load(oof_path, allow_pickle=False) as archive:
+        if set(archive.files) != {
+            "epochs", "validation_rows", "validation_labels",
+            "validation_window_sha256", "causal_logits",
+        }:
+            raise RuntimeError(f"{job_name} OOF 产物字段非法")
         epochs = archive["epochs"].copy()
         validation_rows = archive["validation_rows"].copy()
+        validation_labels = archive["validation_labels"].copy()
+        embedded_validation_hash = str(archive["validation_window_sha256"].item())
         all_logits = archive["causal_logits"].copy()
     epoch_positions = np.flatnonzero(epochs == FIXED_EPOCH)
+    label_field = "stage1_label" if stage == 1 else "stage2_label"
     if (
         epoch_positions.tolist() != [FIXED_EPOCH - 1]
+        or not np.array_equal(epochs, np.arange(1, FIXED_EPOCH + 1))
         or all_logits.ndim != 3
         or all_logits.shape[0] != FIXED_EPOCH
-        or np.any(validation_rows["session"] != 0)
-        or set(validation_rows["run"].tolist()) != {fold}
+        or not np.array_equal(validation_rows, expected_validation_rows)
+        or window_identity_hash(validation_rows) != validation_identity["window_sha256"]
+        or embedded_validation_hash != validation_identity["window_sha256"]
+        or validation_labels.shape != (len(validation_rows),)
+        or not np.array_equal(
+            validation_labels,
+            validation_rows[label_field].astype(np.int64),
+        )
     ):
-        raise RuntimeError(f"{job_name} 公开 OOF epoch 轴或验证 run 非法")
+        raise RuntimeError(f"{job_name} OOF 不能逐行绑定冻结验证窗口")
     saved_epoch50_logits = np.ascontiguousarray(all_logits[epoch_positions[0]], dtype=np.float32)
     if (
         saved_epoch50_logits.shape != (len(validation_rows), classes)
@@ -453,6 +579,12 @@ def load_epoch50_job(
         "seed": seed,
         "checkpoint_epoch": FIXED_EPOCH,
         "epoch_selection_method": "none_fixed_final_epoch",
+        "train_runs": data_contract["train_runs"],
+        "train_window_count": data_contract["train_window_count"],
+        "train_window_sha256": data_contract["train_window_sha256"],
+        "validation_runs": data_contract["validation_runs"],
+        "validation_window_count": data_contract["validation_window_count"],
+        "validation_window_sha256": data_contract["validation_window_sha256"],
         "contract_sha256": config["contract_sha256"],
         "checkpoint_sha256": completed["checkpoint_sha256"],
         "oof_predictions_sha256": completed["artifact_sha256"]["oof_predictions.npz"],
@@ -533,6 +665,7 @@ def output_window_rows(windows: Sequence[ExpectedWindow]) -> np.ndarray:
         rows[index] = (
             window.subject_id, window.session_id, window.run_id, window.segment_id,
             window.window_index, window.window_start_sample, window.window_stop_sample,
+            window.window_start_sample, window.window_stop_sample,
             window.window_stop_sample / NATIVE_SAMPLING_RATE,
         )
     return rows
@@ -635,7 +768,14 @@ def save_seed_result(
 
 # ---------- 端到端 OOF：每个 validation run 只使用对应 fold 的 Stage 1/2 checkpoint ----------
 def run(args: argparse.Namespace) -> dict:
-    output_root = Path(args.output_root).resolve()
+    started_at_utc = datetime.now(timezone.utc).isoformat()
+    subject = args.subject
+    verbose = getattr(args, "verbose", True)
+    defaults = default_subject_paths(subject)
+    bundle_manifest = Path(args.bundle_manifest or defaults.bundle_manifest).resolve()
+    checkpoint_root = Path(args.checkpoint_root or defaults.checkpoint_root).resolve()
+    contract_path = Path(args.inventory_contract or defaults.inventory_contract).resolve()
+    output_root = Path(args.output_root or defaults.output_root).resolve()
     if output_root.exists():
         if not output_root.is_dir() or any(output_root.iterdir()):
             raise FileExistsError(f"输出路径不是空目录，拒绝覆盖: {output_root}")
@@ -652,15 +792,17 @@ def run(args: argparse.Namespace) -> dict:
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
 
-    context = load_bundle(Path(args.bundle_manifest), verify_hashes=True)
+    context = load_bundle(bundle_manifest, verify_hashes=True)
+    if context.manifest.get("subject") != subject:
+        raise RuntimeError("--subject 与 bundle manifest 的被试编号不一致")
     inventory = build_online_inventory(context)
-    contract_path = Path(args.inventory_contract).resolve()
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     no_command_control = verify_inventory_contract(context, inventory, contract)
 
-    seeds = tuple(dict.fromkeys(int(seed) for seed in args.seeds))
+    seeds = tuple(sorted(set(int(seed) for seed in args.seeds)))
     if not seeds or any(seed not in KNOWN_SEEDS for seed in seeds):
         raise ValueError(f"seeds 只能取已训练集合 {KNOWN_SEEDS}")
+    full_seed_grid = seeds == KNOWN_SEEDS
     scores = {
         seed: {
             1: np.full((len(inventory.windows), 2), np.nan, dtype=np.float32),
@@ -678,7 +820,7 @@ def run(args: argparse.Namespace) -> dict:
         for seed in seeds:
             for stage in (1, 2):
                 model, validation_rows, saved_logits, metadata = load_epoch50_job(
-                    context, Path(args.checkpoint_root), fold, seed, stage, device,
+                    context, checkpoint_root, fold, seed, stage, device,
                 )
                 validation_features = materialize_rows(context, validation_rows, fold)
                 reproduced = predict_logits(
@@ -695,11 +837,12 @@ def run(args: argparse.Namespace) -> dict:
                 metadata["saved_oof_reproduction_exact"] = bool(np.array_equal(reproduced, saved_logits))
                 metadata["continuous_window_count"] = int(len(online_indices))
                 checkpoint_records.append(metadata)
-                print(
-                    f"{metadata['job_name']}: saved_oof_max_abs={difference.max():.3g}, "
-                    f"continuous_windows={len(online_indices)}",
-                    flush=True,
-                )
+                if verbose:
+                    print(
+                        f"{metadata['job_name']}: saved_oof_max_abs={difference.max():.3g}, "
+                        f"continuous_windows={len(online_indices)}",
+                        flush=True,
+                    )
                 del model, validation_features, reproduced, continuous
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -716,8 +859,10 @@ def run(args: argparse.Namespace) -> dict:
         seed_artifacts[str(seed)] = artifacts
 
     current_git = git_state()
+    completed_at_utc = datetime.now(timezone.utc).isoformat()
     runtime = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "started_at_utc": started_at_utc,
+        "completed_at_utc": completed_at_utc,
         "hostname": platform.node(),
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -727,14 +872,43 @@ def run(args: argparse.Namespace) -> dict:
         "gpu": None if device.type != "cuda" else torch.cuda.get_device_name(device),
         "git": current_git,
     }
+    protocol_id = (
+        f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_oof_v1"
+        if full_seed_grid
+        else f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_"
+        f"seed_subset_{'_'.join(map(str, seeds))}_diagnostic_v1"
+    )
+    summary = summarize_seed_metrics(seed_results)
+    log_path = output_root / "run_log.json"
+    atomic_json(log_path, {
+        "status": "PASS",
+        "protocol_id": protocol_id,
+        "subject": subject,
+        "included_session": 0,
+        "test_session_access": "forbidden_and_not_loaded",
+        "started_at_utc": started_at_utc,
+        "completed_at_utc": completed_at_utc,
+        "device": str(device),
+        "seeds": list(seeds),
+        "bundle_manifest": display_path(bundle_manifest),
+        "bundle_manifest_sha256": context.manifest_sha256,
+        "checkpoint_root": display_path(checkpoint_root),
+        "inventory_contract": display_path(contract_path),
+        "inventory_contract_sha256": file_hash(contract_path),
+        "inventory": contract["inventory"],
+        "checkpoint_verification": checkpoint_records,
+        "seed_artifacts": seed_artifacts,
+    })
+    log_artifact = {"file": log_path.name, "sha256": file_hash(log_path)}
     manifest = {
         "status": "PASS",
         "claim_status": (
-            "PRECOMMIT_DIAGNOSTIC" if current_git["dirty"] is not False
+            "SEED_SUBSET_DIAGNOSTIC" if not full_seed_grid
+            else "PRECOMMIT_DIAGNOSTIC" if current_git["dirty"] is not False
             else "CLEAN_COMMIT_FORMAL_CANDIDATE"
         ),
-        "protocol_id": "bnci2014001_s01_epoch50_causal_single_window_oof_v1",
-        "subject": 1,
+        "protocol_id": protocol_id,
+        "subject": subject,
         "included_session": 0,
         "test_session_access": "forbidden_and_not_loaded",
         "training_checkpoint_rule": {
@@ -752,9 +926,9 @@ def run(args: argparse.Namespace) -> dict:
             "confidence_threshold": "none",
         },
         "inputs": {
-            "bundle_manifest": display_path(Path(args.bundle_manifest)),
+            "bundle_manifest": display_path(bundle_manifest),
             "bundle_manifest_sha256": context.manifest_sha256,
-            "checkpoint_root": display_path(Path(args.checkpoint_root)),
+            "checkpoint_root": display_path(checkpoint_root),
             "inventory_contract": display_path(contract_path),
             "inventory_contract_sha256": file_hash(contract_path),
         },
@@ -763,28 +937,34 @@ def run(args: argparse.Namespace) -> dict:
         "seeds": list(seeds),
         "checkpoint_records": checkpoint_records,
         "seed_artifacts": seed_artifacts,
-        "summary": summarize_seed_metrics(seed_results),
+        "run_log": log_artifact,
+        "summary": summary,
         "source_sha256": {
             "runner": file_hash(Path(__file__)),
             "protocol_metrics": file_hash(EVAL_DIR / "protocol_metrics.py"),
+            "oof_training_bundle_reader": file_hash(TRAIN_DIR / "oof_training_bundle.py"),
             "model_factory": file_hash(MODELS_DIR / "model_factory.py"),
             "eegnet": file_hash(MODELS_DIR / "models" / "eegnet.py"),
         },
         "runtime": runtime,
     }
     atomic_json(output_root / "run_manifest.json", manifest)
-    print(json.dumps(manifest["summary"], ensure_ascii=False, indent=2, allow_nan=False))
+    if verbose:
+        print(json.dumps(manifest["summary"], ensure_ascii=False, indent=2, allow_nan=False))
     return manifest
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle-manifest", type=Path, default=DEFAULT_BUNDLE)
-    parser.add_argument("--checkpoint-root", type=Path, default=DEFAULT_CHECKPOINT_ROOT)
-    parser.add_argument("--inventory-contract", type=Path, default=DEFAULT_INVENTORY_CONTRACT)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--subject", type=int, choices=KNOWN_SUBJECTS, default=1)
+    # 路径参数为空时由 subject 推导；显式覆盖主要用于预检和迁移验证。
+    parser.add_argument("--bundle-manifest", type=Path)
+    parser.add_argument("--checkpoint-root", type=Path)
+    parser.add_argument("--inventory-contract", type=Path)
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(KNOWN_SEEDS))
+    parser.add_argument("--quiet", dest="verbose", action="store_false", default=True)
     return parser.parse_args()
 
 
