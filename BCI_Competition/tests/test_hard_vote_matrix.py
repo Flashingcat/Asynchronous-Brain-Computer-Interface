@@ -33,6 +33,7 @@ from run_hard_vote_matrix import (  # noqa: E402
     aggregate_subject_matrix,
     runtime_environment,
     validate_policy_config,
+    verify_matrix_child,
 )
 from run_epoch50_online_oof import file_hash  # noqa: E402
 from run_epoch50_online_oof_all_subjects import verify_child_artifacts  # noqa: E402
@@ -113,6 +114,39 @@ class HardVotePolicyTests(unittest.TestCase):
 
 
 class HardVoteMatrixContractTests(unittest.TestCase):
+    def test_child_manifest_requires_artifact_and_segment_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def artifact(name: str) -> dict[str, str]:
+                path = root / name
+                path.write_text(name, encoding="utf-8")
+                return {"file": name, "sha256": file_hash(path)}
+
+            manifest = {
+                "status": "PASS",
+                "subject": 1,
+                "seeds": list(KNOWN_SEEDS),
+                "included_session": 0,
+                "test_session_access": "forbidden_and_not_loaded",
+                "artifact_policy": "official_trial_exclusion",
+                "segment_policy": "separate_clean_segments_no_time_compression",
+                "artifact_policy_binding": "legacy_v1_protocol_contract",
+                "vote_grid": [list(item) for item in VOTE_GRID],
+                "run_log": artifact("run_log.json"),
+                "seed_artifacts": {},
+            }
+            for seed in KNOWN_SEEDS:
+                manifest["seed_artifacts"][str(seed)] = {
+                    "input_scores": {"file": "external.npz", "sha256": "c" * 64},
+                    "metrics": artifact(f"seed{seed}_metrics.json"),
+                    "trajectories": artifact(f"seed{seed}_trajectories.npz"),
+                }
+            verify_matrix_child(root, manifest, 1)
+            changed = {**manifest, "artifact_policy": "unknown"}
+            with self.assertRaisesRegex(RuntimeError, "合同非法"):
+                verify_matrix_child(root, changed, 1)
+
     def test_historical_source_contract_is_checked_without_current_source_equality(self) -> None:
         self.assertEqual(
             FROZEN_INPUT_MASTER_SOURCE_SHA256["single_subject_runner"],

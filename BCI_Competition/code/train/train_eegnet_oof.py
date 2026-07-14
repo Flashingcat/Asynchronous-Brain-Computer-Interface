@@ -46,7 +46,7 @@ from train.oof_training_bundle import (  # noqa: E402
 from model_factory import build_model  # noqa: E402
 
 
-TRAINING_ID = "bnci2014001_s{subject:02d}_eegnet_oof_native250_v1"
+TRAINING_ID = "bnci2014001_s{subject:02d}_eegnet_oof_native250_v2"
 DEFAULT_FOLDS = tuple(range(6))
 DEFAULT_STAGES = (1, 2)
 DEFAULT_DOMAINS = ("causal", "zero_phase")
@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-root", type=Path,
-        default=PROJECT_ROOT / "results" / "checkpoints" / "eegnet_oof_native250_v1",
+        default=PROJECT_ROOT / "results" / "checkpoints" / "eegnet_oof_native250_v2",
     )
     parser.add_argument("--subject", type=int, default=1)
     parser.add_argument("--folds", type=int, nargs="+", default=list(DEFAULT_FOLDS))

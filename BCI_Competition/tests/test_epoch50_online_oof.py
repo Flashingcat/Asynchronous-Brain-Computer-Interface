@@ -26,7 +26,9 @@ from protocol_metrics import (  # noqa: E402
 )
 from run_epoch50_online_oof import (  # noqa: E402
     build_online_inventory,
+    bundle_contract_version,
     default_subject_paths,
+    inventory_contract_protocol_id,
     output_window_rows,
     stateful_argmax_decisions,
     stateless_argmax_decisions,
@@ -48,7 +50,7 @@ def fake_context(subject: int = 1) -> SimpleNamespace:
     for index, start in enumerate(range(500, 1125, 125)):
         rows[index] = (subject, 0, 0, 0, index, start, start + 500, 7, 3, 1, 2, True)
     manifest = {
-        "protocol_id": f"bnci2014001_s{subject:02d}_oof_train_session0_native250_v1",
+        "protocol_id": f"bnci2014001_s{subject:02d}_oof_train_session0_native250_v2",
         "subject": subject,
         "included_session": 0,
         "artifact_policy": "official_trial_exclusion",
@@ -68,6 +70,18 @@ def fake_context(subject: int = 1) -> SimpleNamespace:
 
 
 class InventoryTests(unittest.TestCase):
+    def test_bundle_contract_version_separates_legacy_and_explicit_manifests(self) -> None:
+        explicit = fake_context().manifest
+        self.assertEqual(bundle_contract_version(explicit), "v2")
+        self.assertTrue(inventory_contract_protocol_id(explicit).endswith("_v2"))
+
+        legacy = copy.deepcopy(explicit)
+        legacy["protocol_id"] = "bnci2014001_s01_oof_train_session0_native250_v1"
+        legacy.pop("artifact_policy")
+        legacy.pop("segment_policy")
+        self.assertEqual(bundle_contract_version(legacy), "v1")
+        self.assertTrue(inventory_contract_protocol_id(legacy).endswith("_v1"))
+
     def test_session0_bundle_deterministically_restores_inventory(self) -> None:
         inventory = build_online_inventory(fake_context())
 
@@ -131,7 +145,7 @@ class InventoryTests(unittest.TestCase):
             mode=STATELESS_DIAGNOSTIC,
         )
         contract = {
-            "protocol_id": "bnci2014001_s01_session0_causal_online_v1",
+            "protocol_id": "bnci2014001_s01_session0_causal_online_v2",
             "subject": 1,
             "included_session": 0,
             "test_session_access": "forbidden",
@@ -139,6 +153,9 @@ class InventoryTests(unittest.TestCase):
             "window_samples": 500,
             "step_samples": 125,
             "event_margin_samples": 125,
+            "artifact_policy": "official_trial_exclusion",
+            "segment_policy": "separate_clean_segments_no_time_compression",
+            "artifact_policy_binding": "explicit_bundle_manifest",
             "source_bundle": {
                 "protocol_id": context.manifest["protocol_id"],
                 "manifest_sha256": context.manifest_sha256,

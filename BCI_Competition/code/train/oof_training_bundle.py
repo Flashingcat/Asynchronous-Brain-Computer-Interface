@@ -10,7 +10,10 @@ from pathlib import Path
 import numpy as np
 
 
-BUNDLE_ID = "bnci2014001_s{subject:02d}_oof_train_session0_native250_v1"
+# v1 是已经训练出历史 checkpoint 的旧 bundle：其伪迹语义由精确协议名兼容绑定。
+# v2 是本分支以后新建的 bundle：伪迹与连续 segment 策略必须显式写入清单。
+LEGACY_BUNDLE_ID = "bnci2014001_s{subject:02d}_oof_train_session0_native250_v1"
+BUNDLE_ID = "bnci2014001_s{subject:02d}_oof_train_session0_native250_v2"
 ARTIFACT_POLICY = "official_trial_exclusion"
 SEGMENT_POLICY = "separate_clean_segments_no_time_compression"
 DOMAINS = ("causal", "zero_phase")
@@ -66,18 +69,23 @@ def _safe_relative_file(value: object) -> Path:
 
 
 def artifact_contract(manifest: dict) -> dict[str, str]:
-    """解析伪迹合同；旧 v1 bundle 只在精确协议身份下允许兼容读取。"""
+    """解析伪迹合同，并拒绝同一协议版本同时承载两种清单语义。"""
     subject = manifest.get("subject")
     protocol_id = manifest.get("protocol_id")
     artifact = manifest.get("artifact_policy")
     segment = manifest.get("segment_policy")
-    if artifact == ARTIFACT_POLICY and segment == SEGMENT_POLICY:
+    if (
+        artifact == ARTIFACT_POLICY
+        and segment == SEGMENT_POLICY
+        and type(subject) is int
+        and protocol_id == BUNDLE_ID.format(subject=subject)
+    ):
         binding = "explicit_bundle_manifest"
     elif (
         artifact is None
         and segment is None
         and type(subject) is int
-        and protocol_id == BUNDLE_ID.format(subject=subject)
+        and protocol_id == LEGACY_BUNDLE_ID.format(subject=subject)
     ):
         # 既有 648 个 checkpoint 强哈希绑定了字段修复前的 v1 bundle；仅对此精确
         # 协议身份保留兼容读取，并在新运行清单中显式披露兼容绑定来源。
@@ -95,7 +103,6 @@ def validate_bundle_manifest(manifest: dict) -> None:
     """拒绝含测试 session、缺 fold 或无法绑定输入域的训练 bundle。"""
     subject = int(manifest.get("subject", -1))
     expected = {
-        "protocol_id": BUNDLE_ID.format(subject=subject),
         "dataset": "BNCI2014001",
         "purpose": "session0_only_oof_training_and_validation",
         "included_session": 0,
@@ -104,7 +111,12 @@ def validate_bundle_manifest(manifest: dict) -> None:
         "window_shape": [len(CHANNELS), 500],
         "test_session_content_in_bundle": False,
     }
+    allowed_protocol_ids = {
+        LEGACY_BUNDLE_ID.format(subject=subject),
+        BUNDLE_ID.format(subject=subject),
+    }
     if (subject not in range(1, 10) or
+            manifest.get("protocol_id") not in allowed_protocol_ids or
             any(manifest.get(key) != value for key, value in expected.items())):
         raise RuntimeError("OOF bundle 顶层身份错误")
     artifact_contract(manifest)

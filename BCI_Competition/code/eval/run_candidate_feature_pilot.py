@@ -46,6 +46,7 @@ from run_hard_vote_matrix import (
     _safe_artifact,
     runtime_environment,
 )
+from oof_training_bundle import artifact_contract  # noqa: E402
 
 
 SUBJECT = 1
@@ -465,6 +466,7 @@ def run(args: argparse.Namespace) -> dict:
     config_sha256 = file_hash(config_path)
     contract, configs = load_contract(config_path)
     context, inventory, inventory_contract, _ = _load_subject_inventory(SUBJECT)
+    artifact_identity = artifact_contract(context.manifest)
     expected_rows = output_window_rows(inventory.windows)
     arrays, _, input_identity = load_feature_input(input_root, expected_rows)
     result, trajectory_arrays = run_strategies(
@@ -511,6 +513,7 @@ def run(args: argparse.Namespace) -> dict:
         "seed": SEED,
         "included_session": 0,
         "test_session_access": "forbidden_and_not_loaded",
+        **artifact_identity,
         "strategy_ids": [item.strategy_id for item in configs],
         "policy_contract": contract,
         "policy_contract_file": display_path(config_path),

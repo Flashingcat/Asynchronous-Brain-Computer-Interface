@@ -54,6 +54,11 @@ from run_hard_vote_matrix import (
     runtime_environment,
     verify_input_root,
 )
+from oof_training_bundle import (  # noqa: E402
+    ARTIFACT_POLICY,
+    SEGMENT_POLICY,
+    artifact_contract,
+)
 
 
 DEFAULT_INPUT_ROOT = (
@@ -444,6 +449,11 @@ def _verify_child(
         or tuple(manifest.get("cell_ids", [])) != cell_ids
         or manifest.get("included_session") != 0
         or manifest.get("test_session_access") != "forbidden_and_not_loaded"
+        or manifest.get("artifact_policy") != ARTIFACT_POLICY
+        or manifest.get("segment_policy") != SEGMENT_POLICY
+        or manifest.get("artifact_policy_binding") not in {
+            "explicit_bundle_manifest", "legacy_v1_protocol_contract",
+        }
         or manifest.get("policy_contract_sha256") != policy_sha256
         or manifest.get("source_sha256") != source_hashes
     ):
@@ -486,12 +496,18 @@ def run(args: argparse.Namespace) -> dict:
     cell_ids = tuple(item.cell_id for item in cells)
     children: dict[str, dict] = {}
     subject_summaries: dict[int, dict] = {}
+    matrix_artifact_identity: dict[str, str] | None = None
 
     for subject in KNOWN_SUBJECTS:
         subject_started = datetime.now(timezone.utc).isoformat()
         child_root = output_root / f"subject_{subject:02d}"
         child_root.mkdir(parents=True, exist_ok=True)
         context, inventory, inventory_contract, paths = _load_subject_inventory(subject)
+        subject_artifact_identity = artifact_contract(context.manifest)
+        if matrix_artifact_identity is None:
+            matrix_artifact_identity = subject_artifact_identity
+        elif matrix_artifact_identity != subject_artifact_identity:
+            raise RuntimeError("九被试 OOF bundle 的伪迹合同绑定方式不一致")
         input_child_path = _safe_artifact(
             input_root, input_master["children"][str(subject)]["manifest"],
         )
@@ -532,6 +548,7 @@ def run(args: argparse.Namespace) -> dict:
             "subject": subject,
             "included_session": 0,
             "test_session_access": "forbidden_and_not_loaded",
+            **subject_artifact_identity,
             "cell_ids": list(cell_ids),
             "started_at_utc": subject_started,
             "completed_at_utc": completed,
@@ -546,6 +563,7 @@ def run(args: argparse.Namespace) -> dict:
             "subject": subject,
             "included_session": 0,
             "test_session_access": "forbidden_and_not_loaded",
+            **subject_artifact_identity,
             "seeds": list(KNOWN_SEEDS),
             "cell_ids": list(cell_ids),
             "policy_contract_sha256": policy_sha256,
@@ -578,6 +596,8 @@ def run(args: argparse.Namespace) -> dict:
         }
         print(f"Subject {subject}: PASS", flush=True)
 
+    if matrix_artifact_identity is None:
+        raise RuntimeError("提交-复位矩阵没有加载任何被试伪迹合同")
     summary = _aggregate_subjects(subject_summaries, cells)
     csv_artifacts = _write_csvs(output_root, summary)
     completed_at = datetime.now(timezone.utc).isoformat()
@@ -597,6 +617,7 @@ def run(args: argparse.Namespace) -> dict:
         "subjects": list(KNOWN_SUBJECTS),
         "seeds": list(KNOWN_SEEDS),
         "cell_ids": list(cell_ids),
+        **matrix_artifact_identity,
         "started_at_utc": started_at,
         "completed_at_utc": completed_at,
         "runtime_environment": environment,
@@ -616,6 +637,7 @@ def run(args: argparse.Namespace) -> dict:
         "seeds": list(KNOWN_SEEDS),
         "included_session": 0,
         "test_session_access": "forbidden_and_not_loaded",
+        **matrix_artifact_identity,
         "cell_ids": list(cell_ids),
         "input_master_manifest": {
             "file": display_path(input_root / "run_manifest.json"),

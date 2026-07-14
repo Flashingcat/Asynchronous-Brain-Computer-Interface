@@ -18,8 +18,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 PREPROCESSING = ROOT / "code" / "preprocessing"
 TRAIN = ROOT / "code" / "train"
+EVAL = ROOT / "code" / "eval"
 sys.path.insert(0, str(PREPROCESSING))
 sys.path.insert(0, str(TRAIN))
+sys.path.insert(0, str(EVAL))
 
 from build_causal_filter_store import build_causal_filter_store  # noqa: E402
 from build_fold_normalization import (  # noqa: E402
@@ -32,8 +34,15 @@ from build_protocol_index import build_subject, save_subject  # noqa: E402
 from build_signal_store import build_signal_store  # noqa: E402
 from build_validation_folds import build_fold_manifest, save_fold_manifest  # noqa: E402
 from build_zero_phase_filter_store import build_zero_phase_filter_store  # noqa: E402
-from oof_training_bundle import artifact_contract, file_hash, load_bundle  # noqa: E402
+from oof_training_bundle import (  # noqa: E402
+    BUNDLE_ID,
+    LEGACY_BUNDLE_ID,
+    artifact_contract,
+    file_hash,
+    load_bundle,
+)
 from train_eegnet_oof import JobSpec, prepare_job_arrays  # noqa: E402
+from freeze_online_inventory_contracts import freeze_or_verify  # noqa: E402
 
 
 class RealOOFTrainingBundleTests(unittest.TestCase):
@@ -120,10 +129,21 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
         legacy = dict(self.manifest)
         legacy.pop("artifact_policy")
         legacy.pop("segment_policy")
+        legacy["protocol_id"] = LEGACY_BUNDLE_ID.format(subject=1)
         self.assertEqual(
             artifact_contract(legacy)["artifact_policy_binding"],
             "legacy_v1_protocol_contract",
         )
+
+        # 显式字段只能属于 v2，缺字段只能属于精确 v1；禁止一个版本承载两种语义。
+        explicit_v1 = dict(self.manifest)
+        explicit_v1["protocol_id"] = LEGACY_BUNDLE_ID.format(subject=1)
+        with self.assertRaisesRegex(RuntimeError, "伪迹或连续 segment"):
+            artifact_contract(explicit_v1)
+        missing_v2 = dict(legacy)
+        missing_v2["protocol_id"] = BUNDLE_ID.format(subject=1)
+        with self.assertRaisesRegex(RuntimeError, "伪迹或连续 segment"):
+            artifact_contract(missing_v2)
 
     def test_bundle_loader_opens_no_file_outside_isolated_root(self) -> None:
         real_open = builtins.open
@@ -152,6 +172,28 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
             signal = loaded.stores[domain].read_window(loaded.rows[0])
             self.assertEqual(signal.shape, (22, 500))
         self.assertTrue(np.array_equal(loaded.rows, self.context.rows))
+
+    def test_explicit_v2_bundle_freezes_independent_v2_inventory_contract(self) -> None:
+        """全新 bundle 不得复用仓库内锁定旧 manifest SHA 的 v1 库存文件。"""
+        output_dir = self.root / "v2_inventory_contracts"
+        created = freeze_or_verify(
+            1, True, bundle_root=self.bundle_dir, output_dir=output_dir,
+        )
+        contract_path = Path(created["contract"])
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        self.assertEqual(created["action"], "created_missing")
+        self.assertEqual(
+            contract_path.name,
+            "bnci2014001_s01_session0_causal_online_v2.json",
+        )
+        self.assertEqual(contract["artifact_policy"], "official_trial_exclusion")
+        self.assertEqual(
+            contract["artifact_policy_binding"], "explicit_bundle_manifest",
+        )
+        verified = freeze_or_verify(
+            1, False, bundle_root=self.bundle_dir, output_dir=output_dir,
+        )
+        self.assertEqual(verified["action"], "verified_existing")
 
     def test_copied_signal_hashes_and_fold_statistics_equal_sources(self) -> None:
         normalization_path = self.index_dir / (

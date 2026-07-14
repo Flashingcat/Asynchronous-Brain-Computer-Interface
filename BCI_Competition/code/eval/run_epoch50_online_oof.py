@@ -58,6 +58,8 @@ INFERENCE_BATCH_SIZE = 256
 FIXED_FOLDS = tuple(range(6))
 KNOWN_SEEDS = (42, 43, 44)
 KNOWN_SUBJECTS = tuple(range(1, 10))
+LEGACY_INVENTORY_ID = "bnci2014001_s{subject:02d}_session0_causal_online_v1"
+INVENTORY_ID = "bnci2014001_s{subject:02d}_session0_causal_online_v2"
 OUTPUT_WINDOW_DTYPE = np.dtype([
     ("subject_id", "u1"), ("session_id", "u1"), ("run_id", "u1"),
     ("segment_id", "u1"), ("window_index", "<u4"),
@@ -90,7 +92,7 @@ class SubjectPaths:
 
 
 def default_subject_paths(subject: int) -> SubjectPaths:
-    """按被试编号解析已冻结 bundle、训练矩阵、库存合同和默认结果目录。"""
+    """解析既有 v1 复现实物；全新显式合同流程必须通过 CLI 传入 v2 路径。"""
     if type(subject) is not int or subject not in KNOWN_SUBJECTS:
         raise ValueError(f"subject 只能取 {KNOWN_SUBJECTS}")
     checkpoint_name = (
@@ -113,6 +115,26 @@ def default_subject_paths(subject: int) -> SubjectPaths:
             / f"s{subject:02d}_epoch50_causal_single_window_oof_v1"
         ),
     )
+
+
+def bundle_contract_version(manifest: dict) -> str:
+    """把 bundle 的伪迹绑定方式映射为唯一协议版本。"""
+    subject = manifest.get("subject")
+    if type(subject) is not int or subject not in KNOWN_SUBJECTS:
+        raise RuntimeError("在线库存合同无法从非法被试身份派生")
+    binding = artifact_contract(manifest)["artifact_policy_binding"]
+    return "v2" if binding == "explicit_bundle_manifest" else "v1"
+
+
+def inventory_contract_protocol_id(manifest: dict) -> str:
+    """由 bundle 版本唯一确定在线库存合同协议名。"""
+    subject = manifest["subject"]
+    template = (
+        INVENTORY_ID
+        if bundle_contract_version(manifest) == "v2"
+        else LEGACY_INVENTORY_ID
+    )
+    return template.format(subject=subject)
 
 
 # ---------- 通用审计工具：所有外部输入和输出均以 SHA-256 绑定 ----------
@@ -332,9 +354,10 @@ def verify_inventory_contract(
 ) -> dict:
     """用全 NO_COMMAND 轨迹计算可信库存哈希；缺事件或缺窗口会在正式推理前失败。"""
     subject = context.manifest["subject"]
+    artifact_identity = artifact_contract(context.manifest)
+    expected_protocol_id = inventory_contract_protocol_id(context.manifest)
     if (
-        contract.get("protocol_id")
-        != f"bnci2014001_s{subject:02d}_session0_causal_online_v1"
+        contract.get("protocol_id") != expected_protocol_id
         or contract.get("subject") != subject
         or contract.get("included_session") != 0
         or contract.get("test_session_access") != "forbidden"
@@ -348,6 +371,13 @@ def verify_inventory_contract(
         or contract.get("source_bundle", {}).get("index_sha256") != context.manifest["index_sha256"]
     ):
         raise RuntimeError("在线库存合同与 session0-only bundle 不匹配")
+    # v2 把伪迹和连续 segment 语义写入库存合同；v1 保持历史文件逐字兼容，
+    # 但其 legacy binding 会在下游运行清单中被显式披露。
+    if (
+        artifact_identity["artifact_policy_binding"] == "explicit_bundle_manifest"
+        and any(contract.get(key) != value for key, value in artifact_identity.items())
+    ):
+        raise RuntimeError("v2 在线库存合同没有继承 bundle 的伪迹与 segment 身份")
 
     no_command = [
         DecisionRecord(
@@ -797,6 +827,7 @@ def run(args: argparse.Namespace) -> dict:
     if context.manifest.get("subject") != subject:
         raise RuntimeError("--subject 与 bundle manifest 的被试编号不一致")
     artifact_identity = artifact_contract(context.manifest)
+    output_protocol_version = bundle_contract_version(context.manifest)
     inventory = build_online_inventory(context)
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     no_command_control = verify_inventory_contract(context, inventory, contract)
@@ -875,10 +906,12 @@ def run(args: argparse.Namespace) -> dict:
         "git": current_git,
     }
     protocol_id = (
-        f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_oof_v1"
+        f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_oof_"
+        f"{output_protocol_version}"
         if full_seed_grid
         else f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_"
-        f"seed_subset_{'_'.join(map(str, seeds))}_diagnostic_v1"
+        f"seed_subset_{'_'.join(map(str, seeds))}_diagnostic_"
+        f"{output_protocol_version}"
     )
     summary = summarize_seed_metrics(seed_results)
     log_path = output_root / "run_log.json"

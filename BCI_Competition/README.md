@@ -99,12 +99,26 @@ python BCI_Competition/code/preprocessing/build_oof_training_bundle.py --subject
 训练前先运行真实 GPU 全流程预检，再启动固定 50 epoch 的 OOF 矩阵：
 
 ```powershell
+$bundle = 'BCI_Competition/data/processed/bnci2014001_s01_oof_train_session0_native250_v2/manifest.json'
+$checkpoints = 'BCI_Competition/results/checkpoints/eegnet_oof_native250_v2'
+$inventoryDir = 'BCI_Competition/results/tables/online_inventory_contracts_v2'
+$inventory = "$inventoryDir/bnci2014001_s01_session0_causal_online_v2.json"
+
 python BCI_Competition/code/train/preflight_eegnet_oof.py `
+  --training-bundle $bundle `
   --output-root BCI_Competition/results/checkpoints/eegnet_oof_preflight_native250_v2
-python BCI_Competition/code/train/train_eegnet_oof.py --subject 1
-python BCI_Competition/code/eval/freeze_online_inventory_contracts.py --subjects 1 --write-missing
-python BCI_Competition/code/eval/run_epoch50_online_oof.py --subject 1
+python BCI_Competition/code/train/train_eegnet_oof.py `
+  --subject 1 --training-bundle $bundle --output-root $checkpoints
+python BCI_Competition/code/eval/freeze_online_inventory_contracts.py `
+  --subjects 1 --bundle-root BCI_Competition/data/processed `
+  --output-dir $inventoryDir --write-missing
+python BCI_Competition/code/eval/run_epoch50_online_oof.py `
+  --subject 1 --bundle-manifest $bundle --checkpoint-root $checkpoints `
+  --inventory-contract $inventory `
+  --output-root BCI_Competition/results/tables/s01_epoch50_causal_single_window_oof_v2
 ```
+
+新建流程统一使用显式伪迹合同的 v2 身份；仓库 `config/evaluation/*_v1.json` 只绑定既有 v1 bundle 与历史 checkpoint，不能拿来验证新生成的 bundle。
 
 完整回归必须显式提供真实数据根目录：
 

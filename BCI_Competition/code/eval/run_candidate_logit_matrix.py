@@ -49,6 +49,11 @@ from run_hard_vote_matrix import (
     runtime_environment,
     verify_input_root,
 )
+from oof_training_bundle import (  # noqa: E402
+    ARTIFACT_POLICY,
+    SEGMENT_POLICY,
+    artifact_contract,
+)
 
 
 DEFAULT_INPUT_ROOT = (
@@ -467,6 +472,11 @@ def verify_matrix_child(
         or tuple(manifest.get("strategy_ids", [])) != strategy_ids
         or manifest.get("included_session") != 0
         or manifest.get("test_session_access") != "forbidden_and_not_loaded"
+        or manifest.get("artifact_policy") != ARTIFACT_POLICY
+        or manifest.get("segment_policy") != SEGMENT_POLICY
+        or manifest.get("artifact_policy_binding") not in {
+            "explicit_bundle_manifest", "legacy_v1_protocol_contract",
+        }
         or manifest.get("selection_status") != "none_all_cells_reported"
         or manifest.get("source_sha256") != expected_source_hashes
         or manifest.get("policy_contract_sha256") != expected_policy_sha256
@@ -511,12 +521,18 @@ def run(args: argparse.Namespace) -> dict:
     children: dict[str, dict] = {}
     subject_summaries: dict[int, dict] = {}
     scale_samples = {name: [] for name in SCALE_FIELDS}
+    matrix_artifact_identity: dict[str, str] | None = None
 
     for subject in KNOWN_SUBJECTS:
         subject_started = datetime.now(timezone.utc).isoformat()
         child_root = output_root / f"subject_{subject:02d}"
         child_root.mkdir(parents=True, exist_ok=True)
         context, inventory, contract, paths = _load_subject_inventory(subject)
+        subject_artifact_identity = artifact_contract(context.manifest)
+        if matrix_artifact_identity is None:
+            matrix_artifact_identity = subject_artifact_identity
+        elif matrix_artifact_identity != subject_artifact_identity:
+            raise RuntimeError("九被试 OOF bundle 的伪迹合同绑定方式不一致")
         expected_rows = output_window_rows(inventory.windows)
         input_child_path = _safe_artifact(
             input_root, input_master["children"][str(subject)]["manifest"],
@@ -558,6 +574,7 @@ def run(args: argparse.Namespace) -> dict:
             "subject": subject,
             "included_session": 0,
             "test_session_access": "forbidden_and_not_loaded",
+            **subject_artifact_identity,
             "strategy_ids": list(strategy_ids),
             "started_at_utc": subject_started,
             "completed_at_utc": completed,
@@ -572,6 +589,7 @@ def run(args: argparse.Namespace) -> dict:
             "subject": subject,
             "included_session": 0,
             "test_session_access": "forbidden_and_not_loaded",
+            **subject_artifact_identity,
             "seeds": list(KNOWN_SEEDS),
             "strategy_ids": list(strategy_ids),
             "policy_contract": policy_contract,
@@ -612,6 +630,8 @@ def run(args: argparse.Namespace) -> dict:
         }
         print(f"Subject {subject}: PASS", flush=True)
 
+    if matrix_artifact_identity is None:
+        raise RuntimeError("候选 logit 矩阵没有加载任何被试伪迹合同")
     summary = aggregate_subject_matrix(subject_summaries, configs)
     scale_path = output_root / "input_logit_scale_summary.json"
     atomic_json(scale_path, _summarize_logit_scale(scale_samples))
@@ -634,6 +654,7 @@ def run(args: argparse.Namespace) -> dict:
         "subjects": list(KNOWN_SUBJECTS),
         "seeds": list(KNOWN_SEEDS),
         "strategy_ids": list(strategy_ids),
+        **matrix_artifact_identity,
         "started_at_utc": started_at,
         "completed_at_utc": completed_at,
         "runtime_environment": environment,
@@ -654,6 +675,7 @@ def run(args: argparse.Namespace) -> dict:
         "seeds": list(KNOWN_SEEDS),
         "included_session": 0,
         "test_session_access": "forbidden_and_not_loaded",
+        **matrix_artifact_identity,
         "strategy_ids": list(strategy_ids),
         "input_master_manifest": {
             "file": display_path(input_root / "run_manifest.json"),
