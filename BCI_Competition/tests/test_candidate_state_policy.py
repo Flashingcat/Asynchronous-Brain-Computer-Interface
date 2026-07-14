@@ -13,6 +13,7 @@ sys.path.insert(0, str(EVAL_DIR))
 
 from candidate_state_policy import (  # noqa: E402
     CandidateEvidence,
+    candidate_transition,
     candidate_state_decisions,
 )
 from protocol_metrics import (  # noqa: E402
@@ -20,6 +21,7 @@ from protocol_metrics import (  # noqa: E402
     CANDIDATE_OPEN,
     CANDIDATE_TIMEOUT,
     COMMAND_COMMIT,
+    FAST1_COMMAND_COMMIT,
     IDLE_RESET,
     NO_COMMAND,
     READY,
@@ -241,6 +243,33 @@ class CandidateStatePolicyTests(unittest.TestCase):
         self.assertEqual(result.decisions[-1].transition_reason, COMMAND_COMMIT)
         self.assertEqual(result.decisions[-1].decision_state_after, WAIT_IDLE)
 
+    def test_late_fast1_is_rejected_by_state_machine_and_formal_evaluator(self) -> None:
+        with self.assertRaisesRegex(ValueError, "紧接的第一个窗口"):
+            candidate_transition(
+                TASK_CANDIDATE,
+                1,
+                CandidateEvidence(False, True, NO_COMMAND, False, 2),
+                max_candidate_windows=3,
+            )
+
+        windows = make_windows(3)
+        decisions = [
+            DecisionRecord(1, 0, 0, 0, 0, 0, 500, -1, READY, TASK_CANDIDATE, CANDIDATE_OPEN),
+            DecisionRecord(1, 0, 0, 0, 1, 125, 625, -1, TASK_CANDIDATE, TASK_CANDIDATE),
+            DecisionRecord(
+                1, 0, 0, 0, 2, 250, 750, 2,
+                TASK_CANDIDATE, WAIT_IDLE, FAST1_COMMAND_COMMIT,
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "紧接候选打开"):
+            evaluate_online_events(
+                [ScoringSegment(1, 0, 0, 0, 0, 750)],
+                [],
+                windows,
+                decisions,
+                mode=STATEFUL_CANDIDATE,
+            )
+
     def test_future_evidence_cannot_change_earlier_trace(self) -> None:
         windows = make_windows(6)
         original = [
@@ -282,7 +311,7 @@ class CandidateEvaluatorContractTests(unittest.TestCase):
         windows = make_windows(1)
         segment = [ScoringSegment(1, 0, 0, 0, 0, 500)]
         direct = [DecisionRecord(1, 0, 0, 0, 0, 0, 500, 1, READY, WAIT_IDLE, COMMAND_COMMIT)]
-        with self.assertRaisesRegex(ValueError, "只能从 TASK_CANDIDATE"):
+        with self.assertRaisesRegex(ValueError, "非法的命令提交路径"):
             evaluate_online_events(segment, [], windows, direct, mode=STATEFUL_CANDIDATE)
 
         wrong_reason = [DecisionRecord(

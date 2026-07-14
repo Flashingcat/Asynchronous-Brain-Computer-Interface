@@ -1,0 +1,74 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_fast_path_matrix_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "selection_status": "none_all_cells_reported",
+  "parameter_origin": "fixed descriptive grid after reviewing session0 OOF score scales and post-inference attribution",
+  "strategy_semantics": {
+    "fast0": "opening-window raw Stage 2 evidence may atomically commit from READY to WAIT_IDLE",
+    "fast1": "opening window and immediately following window use an isolated two-window EWMA and raw-class agreement",
+    "slow_fallback": "historical candidate-local Stage 2 EWMA excludes opening window and remains bit-exact when fast paths do not commit",
+    "priority": "Stage 1 abort before Fast-1 before slow commit before timeout; Fast-0 requires the Stage 1 opening condition",
+    "cache_reset": "all fast and slow caches reset at segment boundary and every candidate or command exit",
+    "decision_time": "window stop at native 250 Hz with 500-sample windows and 125-sample steps",
+    "truth_usage": "labels and event boundaries are used only after inference for metrics and timing attribution"
+  },
+  "base_logit_strategy": {
+    "stage1_filter": "ewma_margin",
+    "stage1_alpha": 0.5,
+    "stage1_window": null,
+    "task_on_probability": 0.5,
+    "task_hold_probability": 0.3,
+    "idle_reset_probability": 0.2,
+    "stage1_drop_abort": 0.2,
+    "stage2_filter": "candidate_ewma_centered_logits",
+    "stage2_alpha": 0.5,
+    "stage2_min_candidate_windows": 2,
+    "stage2_top_probability": 0.55,
+    "stage2_probability_gap": 0.15,
+    "stage2_stable_windows": 1,
+    "stage2_max_probability_curvature": null,
+    "max_candidate_windows": 8
+  },
+  "idle_reset_consecutive_windows": 1,
+  "fast0_profiles": {
+    "balanced": {
+      "min_stage1_probability": 0.5,
+      "min_stage1_delta": 0.03,
+      "min_stage2_top_probability": 0.9,
+      "min_stage2_probability_gap": 0.8
+    },
+    "strict": {
+      "min_stage1_probability": 0.5,
+      "min_stage1_delta": 0.03,
+      "min_stage2_top_probability": 0.95,
+      "min_stage2_probability_gap": 0.9
+    }
+  },
+  "fast1_profiles": {
+    "balanced": {
+      "min_stage1_probability": 0.6,
+      "stage2_alpha": 0.5,
+      "min_stage2_top_probability": 0.9,
+      "min_stage2_probability_gap": 0.8,
+      "require_same_raw_class": true
+    },
+    "strict": {
+      "min_stage1_probability": 0.6,
+      "stage2_alpha": 0.5,
+      "min_stage2_top_probability": 0.95,
+      "min_stage2_probability_gap": 0.9,
+      "require_same_raw_class": true
+    }
+  },
+  "cells": [
+    {"cell_id": "anchor_no_fast", "fast0_profile": null, "fast1_profile": null},
+    {"cell_id": "f0_balanced", "fast0_profile": "balanced", "fast1_profile": null},
+    {"cell_id": "f1_balanced", "fast0_profile": null, "fast1_profile": "balanced"},
+    {"cell_id": "f01_balanced", "fast0_profile": "balanced", "fast1_profile": "balanced"},
+    {"cell_id": "f0_strict", "fast0_profile": "strict", "fast1_profile": null},
+    {"cell_id": "f1_strict", "fast0_profile": null, "fast1_profile": "strict"},
+    {"cell_id": "f01_strict", "fast0_profile": "strict", "fast1_profile": "strict"}
+  ]
+}

@@ -30,6 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PREPROCESSING_DIR = PROJECT_ROOT / "code" / "preprocessing"
 MODELS_DIR = PROJECT_ROOT / "code" / "models"
 sys.path.insert(0, str(PROJECT_ROOT / "code"))
+sys.path.insert(0, str(MODELS_DIR))
 
 from train.oof_training_bundle import (  # noqa: E402
     BUNDLE_ID,
@@ -41,7 +42,8 @@ from train.oof_training_bundle import (  # noqa: E402
     rows_for,
     window_identity_hash,
 )
-from models.model_factory import build_model  # noqa: E402
+# 直接绑定本仓库的模型目录，避免原仓库 models/models 包在整套测试中抢占导入名。
+from model_factory import build_model  # noqa: E402
 
 
 TRAINING_ID = "bnci2014001_s{subject:02d}_eegnet_oof_native250_v1"

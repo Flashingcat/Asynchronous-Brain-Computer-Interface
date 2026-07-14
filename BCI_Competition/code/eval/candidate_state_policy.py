@@ -12,6 +12,8 @@ from protocol_metrics import (
     CANDIDATE_OPEN,
     CANDIDATE_TIMEOUT,
     COMMAND_COMMIT,
+    FAST0_COMMAND_COMMIT,
+    FAST1_COMMAND_COMMIT,
     IDLE_RESET,
     NO_COMMAND,
     READY,
@@ -24,12 +26,13 @@ from protocol_metrics import (
 
 @dataclass(frozen=True)
 class CandidateEvidence:
-    """调用方已因果计算好的四项证据；本轮不规定其阈值或聚合算法。"""
+    """调用方已因果计算好的证据；快速提交与慢通道分字段保存。"""
 
     task_on: bool
     task_hold: bool
     stage2_commit_class: int
     idle_reset: bool
+    fast_commit_class: int = NO_COMMAND
 
     def __post_init__(self) -> None:
         for name in ("task_on", "task_hold", "idle_reset"):
@@ -37,13 +40,14 @@ class CandidateEvidence:
             if not isinstance(value, (bool, np.bool_)):
                 raise TypeError(f"{name} 必须为布尔证据")
             object.__setattr__(self, name, bool(value))
-        value = self.stage2_commit_class
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
-            raise TypeError("stage2_commit_class 必须为整数 -1 或 1..4")
-        value = int(value)
-        if value not in (NO_COMMAND, 1, 2, 3, 4):
-            raise ValueError("stage2_commit_class 必须为 -1 或 1..4")
-        object.__setattr__(self, "stage2_commit_class", value)
+        for name in ("stage2_commit_class", "fast_commit_class"):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"{name} 必须为整数 -1 或 1..4")
+            value = int(value)
+            if value not in (NO_COMMAND, 1, 2, 3, 4):
+                raise ValueError(f"{name} 必须为 -1 或 1..4")
+            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
@@ -96,13 +100,26 @@ def candidate_transition(
         raise ValueError("非候选态的 candidate_windows 必须为 0")
     if state == TASK_CANDIDATE and candidate_windows >= max_candidate_windows:
         raise ValueError("候选年龄不得在进入本窗前达到最大候选窗数")
+    if (
+        state == TASK_CANDIDATE
+        and evidence.fast_commit_class != NO_COMMAND
+        and candidate_windows != 0
+    ):
+        raise ValueError("Fast-1 只能在候选打开后紧接的第一个窗口提交")
 
     emitted = NO_COMMAND
     reason: str | None = None
     age_after = candidate_windows
     state_after = state
     if state == READY:
-        if evidence.task_on:
+        if evidence.fast_commit_class != NO_COMMAND:
+            if not evidence.task_on:
+                raise ValueError("Fast-0 提交必须同时满足 Stage 1 开门条件")
+            emitted = evidence.fast_commit_class
+            state_after = WAIT_IDLE
+            reason = FAST0_COMMAND_COMMIT
+            age_after = 0
+        elif evidence.task_on:
             state_after = TASK_CANDIDATE
             reason = CANDIDATE_OPEN
             age_after = 0
@@ -111,6 +128,11 @@ def candidate_transition(
         if not evidence.task_hold:
             state_after = READY
             reason = CANDIDATE_ABORT_STAGE1
+            age_after = 0
+        elif evidence.fast_commit_class != NO_COMMAND:
+            emitted = evidence.fast_commit_class
+            state_after = WAIT_IDLE
+            reason = FAST1_COMMAND_COMMIT
             age_after = 0
         elif evidence.stage2_commit_class != NO_COMMAND:
             emitted = evidence.stage2_commit_class
@@ -121,9 +143,12 @@ def candidate_transition(
             state_after = READY
             reason = CANDIDATE_TIMEOUT
             age_after = 0
-    elif evidence.idle_reset:
-        state_after = READY
-        reason = IDLE_RESET
+    else:
+        if evidence.fast_commit_class != NO_COMMAND:
+            raise ValueError("WAIT_IDLE 中不得生成快速提交证据")
+        if evidence.idle_reset:
+            state_after = READY
+            reason = IDLE_RESET
 
     return CandidateTransition(emitted, state_after, reason, age_after)
 
@@ -183,7 +208,7 @@ def candidate_state_decisions(
     *,
     max_candidate_windows: int,
 ) -> CandidatePolicyResult:
-    """运行可撤销候选态；Stage 2 只在进入候选态后的窗口具有提交权限。"""
+    """运行可撤销候选态；Fast-0 是开门窗原子提交的显式例外。"""
     _validate_inputs(windows, evidence, max_candidate_windows)
     decisions: list[DecisionRecord] = []
     traces: list[CandidateTraceRecord] = []
@@ -191,8 +216,8 @@ def candidate_state_decisions(
     state = READY
     candidate_windows = 0
 
-    # 优先级固定为 Stage 1 撤销 > Stage 2 提交 > 候选超时；提交在最后一个
-    # 允许窗口仍有机会成功。WAIT_IDLE 只响应复位，复位窗口不得同时重新开门。
+    # 候选态优先级固定为 Stage 1 撤销 > Fast-1 > 慢通道 > 超时；Fast-1
+    # 仅允许紧接开门的第一窗。WAIT_IDLE 只响应复位，复位窗不得同时重开。
     for window, item in zip(windows, evidence):
         if window.key != current_key:
             current_key = window.key

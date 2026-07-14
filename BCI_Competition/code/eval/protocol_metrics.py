@@ -26,6 +26,8 @@ CANDIDATE_OPEN = "candidate_open"
 CANDIDATE_ABORT_STAGE1 = "candidate_abort_stage1"
 CANDIDATE_TIMEOUT = "candidate_timeout"
 COMMAND_COMMIT = "command_commit"
+FAST0_COMMAND_COMMIT = "fast0_command_commit"
+FAST1_COMMAND_COMMIT = "fast1_command_commit"
 IDLE_RESET = "idle_reset"
 STAGE1_CLASS_NAMES = ("idle", "task")
 STAGE2_CLASS_NAMES = ("left_hand", "right_hand", "feet", "tongue")
@@ -553,11 +555,27 @@ def _validate_online_inputs(
                     (WAIT_IDLE, READY): {IDLE_RESET},
                 }
                 if record.emitted_class != NO_COMMAND:
+                    # Fast-0 在开门窗原子提交；Fast-1 与慢通道都从候选态提交。
+                    allowed_command_transitions = {
+                        (READY, WAIT_IDLE): {FAST0_COMMAND_COMMIT},
+                        (TASK_CANDIDATE, WAIT_IDLE): {
+                            COMMAND_COMMIT,
+                            FAST1_COMMAND_COMMIT,
+                        },
+                    }
                     if (
-                        transition != (TASK_CANDIDATE, WAIT_IDLE)
-                        or record.transition_reason != COMMAND_COMMIT
+                        transition not in allowed_command_transitions
+                        or record.transition_reason not in allowed_command_transitions[transition]
                     ):
-                        raise ValueError("候选策略只能从 TASK_CANDIDATE 提交命令并进入 WAIT_IDLE")
+                        raise ValueError("候选策略包含非法的命令提交路径")
+                    if (
+                        record.transition_reason == FAST1_COMMAND_COMMIT
+                        and (
+                            index == 0
+                            or ordered[index - 1].transition_reason != CANDIDATE_OPEN
+                        )
+                    ):
+                        raise ValueError("Fast-1 必须紧接候选打开窗口提交")
                 elif (
                     transition not in no_command_contract
                     or record.transition_reason not in no_command_contract[transition]
@@ -610,6 +628,7 @@ def _candidate_diagnostics(
                 CANDIDATE_ABORT_STAGE1,
                 CANDIDATE_TIMEOUT,
                 COMMAND_COMMIT,
+                FAST1_COMMAND_COMMIT,
             }:
                 continue
             if opened is None:  # 前置状态校验已保证不会发生，保留断言防止以后漂移。
@@ -650,6 +669,7 @@ def _candidate_diagnostics(
             CANDIDATE_ABORT_STAGE1,
             CANDIDATE_TIMEOUT,
             COMMAND_COMMIT,
+            FAST1_COMMAND_COMMIT,
             "segment_end_unresolved",
         )
     }
@@ -694,8 +714,12 @@ def _candidate_diagnostics(
         "candidate_opens_per_valid_minute": (
             None if valid_seconds <= 0 else open_count / (valid_seconds / 60.0)
         ),
-        "candidate_command_count": outcome_counts[COMMAND_COMMIT],
-        "candidate_conversion_rate": ratio(outcome_counts[COMMAND_COMMIT]),
+        "candidate_command_count": (
+            outcome_counts[COMMAND_COMMIT] + outcome_counts[FAST1_COMMAND_COMMIT]
+        ),
+        "candidate_conversion_rate": ratio(
+            outcome_counts[COMMAND_COMMIT] + outcome_counts[FAST1_COMMAND_COMMIT]
+        ),
         "candidate_abort_count": abort_count,
         "candidate_abort_rate": ratio(abort_count),
         "candidate_stage1_abort_count": outcome_counts[CANDIDATE_ABORT_STAGE1],

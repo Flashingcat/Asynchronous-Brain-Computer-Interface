@@ -6,6 +6,8 @@ import numpy as np
 
 from protocol_metrics import (
     COMMAND_COMMIT,
+    FAST0_COMMAND_COMMIT,
+    FAST1_COMMAND_COMMIT,
     IDLE_RESET,
     NO_COMMAND,
     WAIT_IDLE,
@@ -76,7 +78,12 @@ def diagnose_commit_reset(
     for key, stream in decisions_by_stream.items():
         pending: DecisionRecord | None = None
         for record in stream:
-            if record.transition_reason == COMMAND_COMMIT:
+            # 三条提交路径都会进入同一 WAIT_IDLE，复位时长应统一计算。
+            if record.transition_reason in {
+                COMMAND_COMMIT,
+                FAST0_COMMAND_COMMIT,
+                FAST1_COMMAND_COMMIT,
+            }:
                 if pending is not None:
                     raise RuntimeError("WAIT_IDLE 尚未结束时出现第二次命令提交")
                 pending = record
@@ -161,7 +168,7 @@ def diagnose_commit_reset(
             item["exit_window_index"],
         ): item
         for item in evaluated["candidate_diagnostics"]["candidate_intervals"]
-        if item["outcome"] == COMMAND_COMMIT
+        if item["outcome"] in {COMMAND_COMMIT, FAST1_COMMAND_COMMIT}
     }
     idle_false_count = 0
     spillover_count = 0
@@ -176,11 +183,20 @@ def diagnose_commit_reset(
             continue  # 该命令由正式评估器归入过早输出或事件内额外输出。
         idle_false_count += 1
         interval = commit_intervals.get(record.identity)
-        if interval is None:
+        if interval is None and record.transition_reason != FAST0_COMMAND_COMMIT:
             raise RuntimeError("IDLE 误指令缺少候选提交区间")
+        # 普通/Fast-1 用候选开门时刻归因；Fast-0 没有候选区间，
+        # 因此用同一决策窗是否跨越真实 MI 结束来识别后沿溢出。
         opened_inside_event = any(
-            event.onset_sample <= interval["open_decision_sample"] <= event.offset_sample
-            and record.window_stop_sample > event.offset_sample
+            (
+                interval is not None
+                and event.onset_sample <= interval["open_decision_sample"] <= event.offset_sample
+                and record.window_stop_sample > event.offset_sample
+            )
+            or (
+                interval is None
+                and record.window_start_sample < event.offset_sample < record.window_stop_sample
+            )
             for event in events_by_stream.get(record.key, [])
         )
         spillover_count += int(opened_inside_event)

@@ -231,6 +231,23 @@ def _softmax(values: np.ndarray) -> np.ndarray:
     return probability
 
 
+def _centered_stage2_logits(logits: np.ndarray) -> np.ndarray:
+    """消除四类 logit 的公共平移，并对极端有限数做溢出保护。"""
+    raw = np.asarray(logits, dtype=np.float64)
+    if raw.shape != (4,) or not np.isfinite(raw).all():
+        raise ValueError("Stage 2 单窗 logits 必须是四维有限向量")
+    with np.errstate(over="ignore", invalid="ignore"):
+        centered = raw - float(np.mean(raw))
+    if not np.isfinite(centered).all():
+        # 公共超大平移本应可消除；先减参考值可避免四个 1e308 求和溢出。
+        with np.errstate(over="ignore", invalid="ignore"):
+            offsets = raw - raw[0]
+            centered = offsets - float(np.mean(offsets))
+    if not np.isfinite(centered).all():
+        raise ValueError("Stage 2 中心化 logits 溢出")
+    return centered
+
+
 # ---------- Stage 1 因果历史：margin-EWMA 与 probability-EWMA 的运算顺序不同 ----------
 class _Stage1Accumulator:
     def __init__(self, config: LogitStrategyConfig) -> None:
@@ -282,18 +299,7 @@ class _Stage2Accumulator:
         self.stable_count = 0
 
     def update(self, logits: np.ndarray) -> tuple[int, float, float, int, float, int]:
-        raw = np.asarray(logits, dtype=np.float64)
-        if raw.shape != (4,) or not np.isfinite(raw).all():
-            raise ValueError("Stage 2 单窗 logits 必须是四维有限向量")
-        with np.errstate(over="ignore", invalid="ignore"):
-            centered = raw - float(np.mean(raw))
-        if not np.isfinite(centered).all():
-            # 公共超大平移本应可消除；先减参考值可避免四个 1e308 求和溢出。
-            with np.errstate(over="ignore", invalid="ignore"):
-                offsets = raw - raw[0]
-                centered = offsets - float(np.mean(offsets))
-        if not np.isfinite(centered).all():
-            raise ValueError("Stage 2 中心化 logits 溢出")
+        centered = _centered_stage2_logits(logits)
         raw_probability = _softmax(centered)
         raw_class = int(np.argmax(raw_probability)) + 1
         self.stable_count = self.stable_count + 1 if raw_class == self.last_raw_class else 1
