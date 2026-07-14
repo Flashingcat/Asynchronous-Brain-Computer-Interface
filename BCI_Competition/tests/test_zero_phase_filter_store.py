@@ -147,6 +147,11 @@ class RealZeroPhaseFilterStoreTests(unittest.TestCase):
     def test_manifest_freezes_filter_edges_and_counts(self) -> None:
         manifest = self.zero_manifest
         self.assertEqual(manifest["protocol_id"], FILTER_ID.format(subject=1))
+        self.assertEqual(manifest["artifact_policy"], "official_trial_exclusion")
+        self.assertEqual(
+            manifest["segment_policy"],
+            "separate_clean_segments_no_time_compression",
+        )
         self.assertEqual(manifest["causality"],
                          "noncausal_uses_past_and_future_within_fir_half_support")
         self.assertEqual(manifest["filter"]["filter_length_samples"], 413)

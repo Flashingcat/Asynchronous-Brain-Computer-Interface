@@ -15,8 +15,8 @@ from build_causal_filter_store import (
     is_sha256,
 )
 from build_offline_view import load_base
-from build_protocol_index import FS, file_hash
-from build_signal_store import EEG_CHANNELS, write_frozen_json
+from build_protocol_index import ARTIFACT_POLICY, FS, file_hash
+from build_signal_store import EEG_CHANNELS, SEGMENT_POLICY, write_frozen_json
 from build_validation_folds import FOLD_ID, build_fold_manifest, load_offline
 from build_zero_phase_filter_store import (
     FILTER_ID as ZERO_PHASE_ID,
@@ -197,6 +197,8 @@ def build_normalization_manifest(index_dir: Path, signal_dir: Path,
         "subject": subject,
         "sampling_rate": FS,
         "channels": list(EEG_CHANNELS),
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "method": "per_channel_zscore",
         "fit_scope": "shared_formal_stage1_training_windows_only",
         "aggregation_axes": "window_and_time",
@@ -235,6 +237,8 @@ def validate_normalization_manifest(manifest: dict) -> None:
         "protocol_id": NORMALIZATION_ID.format(subject=subject),
         "sampling_rate": FS,
         "channels": list(EEG_CHANNELS),
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "method": "per_channel_zscore",
         "fit_scope": "shared_formal_stage1_training_windows_only",
         "aggregation_axes": "window_and_time",

@@ -8,9 +8,10 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import sosfilt
 
-from build_protocol_index import FS, file_hash
+from build_protocol_index import ARTIFACT_POLICY, FS, file_hash
 from build_signal_store import (
     EEG_CHANNELS,
+    SEGMENT_POLICY,
     SIGNAL_ID,
     SignalStore,
     write_frozen_array,
@@ -84,6 +85,8 @@ def validate_source_manifest(manifest: dict, subject: int) -> None:
         "channels": list(EEG_CHANNELS),
         "stored_unit": "volts",
         "dtype": "float32",
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "preprocessing": "unit_conversion_only_no_filter_no_standardization",
     }
     mismatches = {
@@ -150,6 +153,8 @@ def validate_filter_manifest(manifest: dict) -> None:
         "channels": list(EEG_CHANNELS),
         "stored_unit": "volts",
         "dtype": "float32",
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "preprocessing": "causal_bandpass_only_no_standardization_no_resampling",
         "filter": frozen_filter_spec(),
         "warmup_policy": frozen_warmup_policy(),
@@ -235,6 +240,8 @@ def build_causal_filter_store(signal_dir: Path, output_dir: Path,
         "stored_unit": "volts",
         "dtype": "float32",
         "layout": "channels_first_c_contiguous",
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "preprocessing": "causal_bandpass_only_no_standardization_no_resampling",
         "filter": frozen_filter_spec(),
         "warmup_policy": frozen_warmup_policy(),

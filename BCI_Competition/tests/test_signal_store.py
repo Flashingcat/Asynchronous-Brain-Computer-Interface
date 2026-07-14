@@ -21,6 +21,7 @@ from build_offline_view import build_offline_view  # noqa: E402
 from build_protocol_index import build_subject, save_subject, vector  # noqa: E402
 from build_signal_store import (  # noqa: E402
     EEG_CHANNELS,
+    SEGMENT_POLICY,
     SIGNAL_ID,
     SignalStore,
     build_signal_store,
@@ -76,6 +77,8 @@ class RealSignalStoreTests(unittest.TestCase):
         self.assertEqual((manifest["source_unit"], manifest["stored_unit"]),
                          ("microvolts", "volts"))
         self.assertEqual(manifest["dtype"], "float32")
+        self.assertEqual(manifest["artifact_policy"], "official_trial_exclusion")
+        self.assertEqual(manifest["segment_policy"], SEGMENT_POLICY)
         self.assertEqual(len(manifest["segments"]), 34)
         self.assertEqual((manifest["summaries"]["0train"]["segments"],
                           manifest["summaries"]["1test"]["segments"]), (21, 13))

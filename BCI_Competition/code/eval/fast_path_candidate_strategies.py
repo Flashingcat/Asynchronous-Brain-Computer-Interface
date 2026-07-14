@@ -256,7 +256,7 @@ def fast_path_candidate_decisions(
         task_on = filtered_probability >= base.task_on_probability
         task_hold = filtered_probability >= base.task_hold_probability and not drop_abort
 
-        # 慢通道仍只消费开门后的窗，所有原锯点语义保持不变。
+        # 慢通道仍只消费开门后的窗，所有原锚点语义保持不变。
         slow_class, slow_top, slow_gap = NO_COMMAND, -1.0, -1.0
         slow_count, slow_stability, slow_curvature = 0, 0, -1.0
         slow_commit = NO_COMMAND

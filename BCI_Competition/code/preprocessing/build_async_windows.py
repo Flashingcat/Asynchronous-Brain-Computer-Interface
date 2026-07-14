@@ -106,7 +106,7 @@ def main() -> None:
         "window_seconds": WINDOW_SECONDS,
         "stride_seconds": STRIDE_SECONDS,
         "task_seconds": TASK_SECONDS,
-        "task_definition": "BNCI2014001 cue-onset to cue-onset+4s, corresponding to trial 3-7s motor imagery",
+        "task_definition": "MOABB cue-onset to cue-onset+4s, corresponding to raw MAT trial 2-6s motor imagery",
         "idle_definition": "all 2s windows that do not overlap any task interval",
         "classes": CLASS_NAMES,
         "n_train": int((split == 0).sum()),

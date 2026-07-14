@@ -51,6 +51,8 @@ def fake_context(subject: int = 1) -> SimpleNamespace:
         "protocol_id": f"bnci2014001_s{subject:02d}_oof_train_session0_native250_v1",
         "subject": subject,
         "included_session": 0,
+        "artifact_policy": "official_trial_exclusion",
+        "segment_policy": "separate_clean_segments_no_time_compression",
         "test_session_content_in_bundle": False,
         "index_sha256": "b" * 64,
         "domains": {

@@ -125,6 +125,11 @@ class RealCausalFilterStoreTests(unittest.TestCase):
     def test_manifest_freezes_filter_and_startup_policy(self) -> None:
         self.assertEqual(self.manifest["protocol_id"], FILTER_ID.format(subject=1))
         self.assertEqual(self.manifest["sampling_rate"], 250)
+        self.assertEqual(self.manifest["artifact_policy"], "official_trial_exclusion")
+        self.assertEqual(
+            self.manifest["segment_policy"],
+            "separate_clean_segments_no_time_compression",
+        )
         self.assertEqual(self.manifest["filter"]["butterworth_N"], 4)
         self.assertEqual(self.manifest["filter"]["realized_bandpass_order"], 8)
         self.assertEqual(self.manifest["warmup_policy"]["configured_samples"], 250)
@@ -197,6 +202,11 @@ class RealCausalFilterStoreTests(unittest.TestCase):
         wrong["stored_unit"] = "microvolts"
         with self.assertRaises(RuntimeError):
             validate_source_manifest(wrong, 1)
+
+        wrong_artifact = json.loads(json.dumps(self.raw_manifest))
+        wrong_artifact["artifact_policy"] = "unknown"
+        with self.assertRaises(RuntimeError):
+            validate_source_manifest(wrong_artifact, 1)
 
         wrong_filter = json.loads(json.dumps(self.manifest))
         wrong_filter["filter"]["butterworth_N"] = 2

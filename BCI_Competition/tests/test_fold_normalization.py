@@ -110,6 +110,11 @@ class RealFoldNormalizationTests(unittest.TestCase):
     def test_manifest_counts_fold_runs_and_portable_sources(self) -> None:
         manifest = self.manifest
         self.assertEqual(manifest["protocol_id"], NORMALIZATION_ID.format(subject=1))
+        self.assertEqual(manifest["artifact_policy"], "official_trial_exclusion")
+        self.assertEqual(
+            manifest["segment_policy"],
+            "separate_clean_segments_no_time_compression",
+        )
         self.assertEqual(manifest["shared_pool"]["stage1_window_count"], 2454)
         self.assertEqual(manifest["shared_pool"]["stage2_window_count"], 1365)
         self.assertEqual(

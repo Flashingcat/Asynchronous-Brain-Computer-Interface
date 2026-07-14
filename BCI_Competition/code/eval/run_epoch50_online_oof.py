@@ -33,6 +33,7 @@ for source_dir in (TRAIN_DIR, MODELS_DIR, EVAL_DIR):
 from model_factory import build_model  # noqa: E402
 from oof_training_bundle import (  # noqa: E402
     BundleContext,
+    artifact_contract,
     load_bundle,
     rows_for,
     window_identity_hash,
@@ -795,6 +796,7 @@ def run(args: argparse.Namespace) -> dict:
     context = load_bundle(bundle_manifest, verify_hashes=True)
     if context.manifest.get("subject") != subject:
         raise RuntimeError("--subject 与 bundle manifest 的被试编号不一致")
+    artifact_identity = artifact_contract(context.manifest)
     inventory = build_online_inventory(context)
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     no_command_control = verify_inventory_contract(context, inventory, contract)
@@ -886,6 +888,7 @@ def run(args: argparse.Namespace) -> dict:
         "subject": subject,
         "included_session": 0,
         "test_session_access": "forbidden_and_not_loaded",
+        **artifact_identity,
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
         "device": str(device),
@@ -911,6 +914,7 @@ def run(args: argparse.Namespace) -> dict:
         "subject": subject,
         "included_session": 0,
         "test_session_access": "forbidden_and_not_loaded",
+        **artifact_identity,
         "training_checkpoint_rule": {
             "training_budget_epochs": FIXED_EPOCH,
             "checkpoint_epoch": FIXED_EPOCH,

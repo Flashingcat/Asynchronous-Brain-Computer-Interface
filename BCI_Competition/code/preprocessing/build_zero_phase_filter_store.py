@@ -12,9 +12,10 @@ import numpy as np
 from mne.filter import create_filter, filter_data
 
 from build_causal_filter_store import is_sha256, validate_source_manifest
-from build_protocol_index import FS, file_hash
+from build_protocol_index import ARTIFACT_POLICY, FS, file_hash
 from build_signal_store import (
     EEG_CHANNELS,
+    SEGMENT_POLICY,
     SIGNAL_ID,
     SignalStore,
     write_frozen_array,
@@ -165,6 +166,8 @@ def validate_filter_manifest(manifest: dict) -> None:
         "stored_unit": "volts",
         "dtype": "float32",
         "layout": "channels_first_c_contiguous",
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "preprocessing": "zero_phase_fir_only_no_standardization_no_resampling",
         "causality": "noncausal_uses_past_and_future_within_fir_half_support",
         "edge_policy": frozen_edge_policy(),
@@ -257,6 +260,8 @@ def build_zero_phase_filter_store(signal_dir: Path, output_dir: Path,
         "stored_unit": "volts",
         "dtype": "float32",
         "layout": "channels_first_c_contiguous",
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "preprocessing": "zero_phase_fir_only_no_standardization_no_resampling",
         "causality": "noncausal_uses_past_and_future_within_fir_half_support",
         "filter": frozen_filter_spec(coefficients),

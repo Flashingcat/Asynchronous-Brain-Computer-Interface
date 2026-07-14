@@ -330,7 +330,7 @@ truth-aware 诊断说明模型分数中确实存在提前 `0.5–1.0s` 的正确
 
 本轮把 6.10 节的局部 crossing 诊断改成完整状态轨迹：Fast-0 可在开门窗原子提交，Fast-1 只联合开门窗和紧接的下一窗，二者均未提交时继续历史慢通道。三套缓存彼此分离；无快速通道 cell 已逐窗断言完全复现 `c055_r020_l1` 的状态、输出和慢通道分数。复位仍为 Stage 1 Task 概率 `<=0.20` 的单窗确认，候选上限仍是开门后的八窗。
 
-最终有效预提交目录为 `results/tables/s01_s09_epoch50_causal_fast_path_matrix_precommit_v3`，顶层及九个被试清单均为 `PASS`，共覆盖九被试、三个配对 seed、七个并列 cell，明确记录 `test_session_access=forbidden_and_not_loaded`。`precommit_v1` 是外层运行时限过短留下的未完成目录；v2 的数值虽经独立复算无误，但底层形式合同尚未拒绝“第二个及更晚候选窗伪装成 Fast-1”，且 CSV 和 NPZ 的审计字段不完整，均由 v3 取代。
+最终有效目录为 `results/tables/s01_s09_epoch50_causal_fast_path_matrix_contractfix_v4`，顶层及九个被试清单均为 `PASS`，共覆盖九被试、三个配对 seed、七个并列 cell，明确记录 `test_session_access=forbidden_and_not_loaded`、`artifact_policy=official_trial_exclusion` 和独立的 `segment_policy`。`precommit_v1` 是外层运行时限过短留下的未完成目录；v2 的数值虽经独立复算无误，但底层形式合同尚未拒绝“第二个及更晚候选窗伪装成 Fast-1”，且 CSV 和 NPZ 的审计字段不完整；v3 修复了这些问题，v4 再补齐顶层伪迹合同传播并绑定最终 PR 候选源码。
 
 | cell | 正确事件率 | 事件触发率 | 触发后分类准确率 | FAR/分钟 | 正确事件中位延迟/s | 快速命令占比 |
 |---|---:|---:|---:|---:|---:|---:|

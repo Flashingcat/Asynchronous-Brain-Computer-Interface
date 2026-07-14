@@ -26,8 +26,10 @@ import sys
 sys.path.insert(0, str(TRAIN_DIR))
 
 from oof_training_bundle import (  # noqa: E402
+    ARTIFACT_POLICY,
     BUNDLE_ID,
     DOMAINS,
+    SEGMENT_POLICY,
     file_hash,
     load_bundle,
     window_identity_hash,
@@ -211,6 +213,8 @@ def build_bundle(index_dir: Path, signal_dir: Path, normalization_path: Path,
         "sampling_rate": 250,
         "channels": loaded_normalization["channels"],
         "window_shape": [len(loaded_normalization["channels"]), 500],
+        "artifact_policy": ARTIFACT_POLICY,
+        "segment_policy": SEGMENT_POLICY,
         "test_session_content_in_bundle": False,
         "index_file": index_path.name,
         "index_sha256": index_sha256,

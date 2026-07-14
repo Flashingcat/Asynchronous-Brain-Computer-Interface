@@ -32,7 +32,7 @@ from build_protocol_index import build_subject, save_subject  # noqa: E402
 from build_signal_store import build_signal_store  # noqa: E402
 from build_validation_folds import build_fold_manifest, save_fold_manifest  # noqa: E402
 from build_zero_phase_filter_store import build_zero_phase_filter_store  # noqa: E402
-from oof_training_bundle import file_hash, load_bundle  # noqa: E402
+from oof_training_bundle import artifact_contract, file_hash, load_bundle  # noqa: E402
 from train_eegnet_oof import JobSpec, prepare_job_arrays  # noqa: E402
 
 
@@ -78,6 +78,14 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
     def test_golden_counts_folds_and_only_session0_segments(self) -> None:
         manifest = self.manifest
         self.assertFalse(manifest["test_session_content_in_bundle"])
+        self.assertEqual(
+            artifact_contract(manifest),
+            {
+                "artifact_policy": "official_trial_exclusion",
+                "segment_policy": "separate_clean_segments_no_time_compression",
+                "artifact_policy_binding": "explicit_bundle_manifest",
+            },
+        )
         self.assertEqual(manifest["shared_pool"]["stage1_window_count"], 2454)
         self.assertEqual(manifest["shared_pool"]["stage2_window_count"], 1365)
         self.assertEqual(
@@ -97,6 +105,25 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
             self.assertTrue(all(key[0] == 0 for key in self.context.stores[domain]._records))
         self.assertFalse(any("session1" in path.name
                              for path in self.bundle_root.rglob("*")))
+
+    def test_artifact_contract_rejects_partial_or_wrong_identity(self) -> None:
+        partial = dict(self.manifest)
+        partial.pop("segment_policy")
+        with self.assertRaisesRegex(RuntimeError, "伪迹或连续 segment"):
+            artifact_contract(partial)
+
+        wrong = dict(self.manifest)
+        wrong["artifact_policy"] = "unknown"
+        with self.assertRaisesRegex(RuntimeError, "伪迹或连续 segment"):
+            artifact_contract(wrong)
+
+        legacy = dict(self.manifest)
+        legacy.pop("artifact_policy")
+        legacy.pop("segment_policy")
+        self.assertEqual(
+            artifact_contract(legacy)["artifact_policy_binding"],
+            "legacy_v1_protocol_contract",
+        )
 
     def test_bundle_loader_opens_no_file_outside_isolated_root(self) -> None:
         real_open = builtins.open
