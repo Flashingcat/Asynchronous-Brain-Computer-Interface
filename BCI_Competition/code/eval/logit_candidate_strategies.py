@@ -138,8 +138,12 @@ class LogitStrategyConfig:
         on = _probability(payload["task_on_probability"], "task_on_probability")
         hold = _probability(payload["task_hold_probability"], "task_hold_probability")
         reset = _probability(payload["idle_reset_probability"], "idle_reset_probability")
-        if not reset <= hold <= on:
-            raise ValueError("Stage 1 阈值必须满足 idle_reset <= task_hold <= task_on")
+        # task_hold 只控制候选态是否继续，idle_reset 只控制命令发出后的复位；
+        # 二者职责分离后不再强制排序，但复位阈值必须低于重新开门阈值以保留滞回区。
+        if not hold <= on:
+            raise ValueError("Stage 1 阈值必须满足 task_hold <= task_on")
+        if not reset < on:
+            raise ValueError("Stage 1 阈值必须满足 idle_reset < task_on")
         drop = _optional_float(payload["stage1_drop_abort"], "stage1_drop_abort")
         if drop is not None and not 0.0 < drop <= 1.0:
             raise ValueError("stage1_drop_abort 必须位于 (0,1]")
@@ -191,6 +195,8 @@ class LogitWindowTrace:
     stage1_raw_task_probability: float
     stage1_filtered_task_probability: float
     stage1_filtered_delta: float
+    idle_reset_raw_condition: bool
+    idle_reset_consecutive_count: int
     stage2_candidate_window_count: int
     stage2_top_class: int
     stage2_top_probability: float
@@ -344,10 +350,14 @@ def logit_candidate_decisions(
     stage1_logits: np.ndarray,
     stage2_logits: np.ndarray,
     config: LogitStrategyConfig,
+    *,
+    idle_reset_consecutive_windows: int = 1,
 ) -> LogitStrategyResult:
     """逐 segment 因果更新分数；候选专属 Stage 2 历史绝不包含开门窗。"""
     if not isinstance(config, LogitStrategyConfig):
         raise TypeError("config 必须为 LogitStrategyConfig")
+    if type(idle_reset_consecutive_windows) is not int or idle_reset_consecutive_windows < 1:
+        raise ValueError("idle_reset_consecutive_windows 必须为正整数")
     stage1 = np.asarray(stage1_logits, dtype=np.float64)
     stage2 = np.asarray(stage2_logits, dtype=np.float64)
     if (
@@ -369,6 +379,7 @@ def logit_candidate_decisions(
     current_key: tuple[int, int, int, int] | None = None
     state = READY
     candidate_age = 0
+    idle_reset_count = 0
     stage1_accumulator = _Stage1Accumulator(config)
     stage2_accumulator = _Stage2Accumulator(config)
 
@@ -376,7 +387,7 @@ def logit_candidate_decisions(
     for index, window in enumerate(windows):
         if window.key != current_key:
             current_key = window.key
-            state, candidate_age = READY, 0
+            state, candidate_age, idle_reset_count = READY, 0, 0
             stage1_accumulator = _Stage1Accumulator(config)
             stage2_accumulator.reset()
         with np.errstate(over="ignore", invalid="ignore"):
@@ -417,11 +428,23 @@ def logit_candidate_decisions(
             config.stage1_drop_abort is not None
             and delta <= -config.stage1_drop_abort
         )
+
+        # 连续复位证据只在 WAIT_IDLE 内累计；任一不满足窗口、离开等待态或
+        # segment 切换都会清零。这里保存原始条件与连续计数，方便独立复算。
+        idle_reset_raw = filtered_probability <= config.idle_reset_probability
+        if state == WAIT_IDLE and idle_reset_raw:
+            idle_reset_count += 1
+        else:
+            idle_reset_count = 0
+        idle_reset_confirmed = (
+            state == WAIT_IDLE
+            and idle_reset_count >= idle_reset_consecutive_windows
+        )
         evidence = CandidateEvidence(
             filtered_probability >= config.task_on_probability,
             filtered_probability >= config.task_hold_probability and not drop_abort,
             commit_class,
-            filtered_probability <= config.idle_reset_probability,
+            idle_reset_confirmed,
         )
         transition = candidate_transition(
             state,
@@ -436,6 +459,8 @@ def logit_candidate_decisions(
             raw_probability,
             filtered_probability,
             delta,
+            idle_reset_raw,
+            idle_reset_count,
             candidate_count,
             top_class,
             top_probability,
@@ -454,6 +479,8 @@ def logit_candidate_decisions(
             stage2_accumulator.reset()
         state = transition.state_after
         candidate_age = transition.candidate_windows_after
+        if state != WAIT_IDLE:
+            idle_reset_count = 0
 
     policy = candidate_state_decisions(
         windows,

@@ -1,0 +1,78 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_commit_reset_matrix_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "selection_status": "none_all_cells_reported",
+  "parameter_origin": "fixed diagnostic grid after reviewing session0 OOF state trajectories",
+  "strategy_semantics": {
+    "factorization": "stage2 commit threshold crossed with independent stage1 WAIT_IDLE reset threshold and confirmation length",
+    "stage1_score": "sigmoid of alpha0.5 EWMA over task_logit-minus-idle_logit",
+    "stage2_score": "softmax of candidate-local alpha0.5 EWMA over per-window centered logits",
+    "candidate_history": "excludes opening window and clears on every candidate exit and segment boundary",
+    "reset_history": "counts qualifying windows only while WAIT_IDLE and clears on failure, reset, or segment boundary",
+    "decision_time": "window stop at native 250 Hz with 500-sample windows and 125-sample steps",
+    "truth_usage": "labels and event boundaries are used only after inference for metrics and timing attribution"
+  },
+  "base_strategy": {
+    "stage1_filter": "ewma_margin",
+    "stage1_alpha": 0.5,
+    "stage1_window": null,
+    "task_on_probability": 0.5,
+    "task_hold_probability": 0.3,
+    "stage1_drop_abort": 0.2,
+    "stage2_filter": "candidate_ewma_centered_logits",
+    "stage2_alpha": 0.5,
+    "stage2_min_candidate_windows": 2,
+    "stage2_probability_gap": 0.15,
+    "stage2_stable_windows": 1,
+    "stage2_max_probability_curvature": null,
+    "max_candidate_windows": 8
+  },
+  "commit_profiles": [
+    {
+      "profile_id": "c055",
+      "stage2_top_probability": 0.55
+    },
+    {
+      "profile_id": "c0625",
+      "stage2_top_probability": 0.625
+    },
+    {
+      "profile_id": "c070",
+      "stage2_top_probability": 0.7
+    }
+  ],
+  "reset_profiles": [
+    {
+      "profile_id": "r020_l1",
+      "idle_reset_probability": 0.2,
+      "consecutive_windows": 1
+    },
+    {
+      "profile_id": "r020_l2",
+      "idle_reset_probability": 0.2,
+      "consecutive_windows": 2
+    },
+    {
+      "profile_id": "r030_l1",
+      "idle_reset_probability": 0.3,
+      "consecutive_windows": 1
+    },
+    {
+      "profile_id": "r030_l2",
+      "idle_reset_probability": 0.3,
+      "consecutive_windows": 2
+    },
+    {
+      "profile_id": "r040_l1",
+      "idle_reset_probability": 0.4,
+      "consecutive_windows": 1
+    },
+    {
+      "profile_id": "r040_l2",
+      "idle_reset_probability": 0.4,
+      "consecutive_windows": 2
+    }
+  ]
+}
