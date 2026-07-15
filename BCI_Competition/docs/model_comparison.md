@@ -1,25 +1,25 @@
-# Model Comparison on BNCI2014001 Subject 1
+# BNCI2014001 被试1 模型对比
 
-| Model | Balanced Accuracy | Stage 1 Binary | Stage 2 MI | Params |
-|-------|:----------------:|:--------------:|:----------:|:------:|
-| conformer | **0.662** | 0.752 | 0.726 | Heavy |
-| **eegnet_attn** | **0.650** | 0.718 | 0.742 | Light |
-| eegnet | 0.613 | 0.731 | 0.706 | Lightest |
-| deepcnn | 0.555 | 0.770 | 0.622 | Medium |
-| deformer | 0.547 | 0.594 | 0.640 | Heavy |
-| shallowconvnet | 0.545 | 0.732 | 0.671 | Light |
-| dbconformer | 0.527* | — | — | Heaviest |
+| 模型 | 平衡准确率 | Stage 1 二分类 | Stage 2 MI | 参数量 |
+|------|:----------:|:-------------:|:----------:|:------:|
+| conformer | **0.662** | 0.752 | 0.726 | 重 |
+| eegnet_attn | **0.650** | 0.718 | 0.742 | 轻 |
+| eegnet | 0.613 | 0.731 | 0.706 | 最轻 |
+| deepcnn | 0.555 | 0.770 | 0.622 | 中 |
+| deformer | 0.547 | 0.594 | 0.640 | 重 |
+| shallowconvnet | 0.545 | 0.732 | 0.671 | 轻 |
+| dbconformer | 0.527* | — | — | 最重 |
 
-*\*dbconformer OOM on test set, validation only.*
+*\*dbconformer 测试集显存不足，仅验证集结果。*
 
-## Key Findings
+## 主要发现
 
-1. **Conformer is best**, but EEGNet_Attn (your model) is close behind at 1.2% gap with far fewer parameters
-2. **EEGNet_Attn has the best Stage 2 MI accuracy** (0.742) — it's best at distinguishing left/right/feet/tongue
-3. **Original EEGNet is a strong baseline** — beats all other CNN variants
-4. **Deep CNNs underperform** — deeper isn't better for this dataset
-5. **Voting hurts performance** — single window > any voting strategy for these models
+1. **Conformer 整体最优**，但 eegnet_attn 差距很小（1.2%），参数量远少于 conformer
+2. **EEGNet_Attn 的 Stage 2 MI 准确率最高**（0.742）—— 最擅长区分左手/右手/脚/舌头
+3. **原始 EEGNet 是强基线** —— 优于所有其他 CNN 变体
+4. **深层 CNN 表现不佳** —— 网络更深不一定更优
+5. **投票策略反而降低性能** —— 单窗口优于所有多窗口投票方案
 
-## Recommendation
+## 建议
 
-Use **conformer** if you want max accuracy, or **eegnet_attn** for a good balance of accuracy and speed.
+追求最高准确率用 **conformer**，追求准确率和速度的平衡用 **eegnet_attn**。
