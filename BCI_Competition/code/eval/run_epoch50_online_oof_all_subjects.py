@@ -24,7 +24,7 @@ from run_epoch50_online_oof import (
 
 DEFAULT_OUTPUT_ROOT = (
     PROJECT_ROOT / "results" / "tables"
-    / "s01_s09_epoch50_causal_single_window_oof_v1"
+    / "s01_s09_epoch50_causal_single_window_oof_v3"
 )
 
 
@@ -141,23 +141,28 @@ def aggregate_subject_summaries(
         raise RuntimeError("被试 manifest 集合与请求范围不一致")
 
     result: dict[str, dict] = {}
+    protocol_versions: set[str] = set()
     for subject in subjects:
         manifest = manifests[subject]
-        expected_protocol = (
-            f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_oof_v1"
+        prefix = (
+            f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_oof_"
             if seeds == KNOWN_SEEDS
             else f"bnci2014001_s{subject:02d}_epoch50_causal_single_window_"
-            f"seed_subset_{'_'.join(map(str, seeds))}_diagnostic_v1"
+            f"seed_subset_{'_'.join(map(str, seeds))}_diagnostic_"
         )
+        expected_protocols = {f"{prefix}v{version}" for version in (1, 2, 3, 4)}
         if (
             manifest.get("status") != "PASS"
             or manifest.get("subject") != subject
-            or manifest.get("protocol_id") != expected_protocol
+            or manifest.get("protocol_id") not in expected_protocols
             or tuple(manifest.get("seeds", [])) != seeds
             or manifest.get("included_session") != 0
             or manifest.get("test_session_access") != "forbidden_and_not_loaded"
         ):
             raise RuntimeError(f"Subject {subject} 单被试 manifest 合同非法")
+        protocol_versions.add(manifest["protocol_id"].rsplit("_v", 1)[1])
+    if len(protocol_versions) != 1:
+        raise RuntimeError("跨被试汇总不得混用不同在线库存合同版本")
 
     for mode in (STATELESS_DIAGNOSTIC, STATEFUL_STRICT):
         first_metrics = manifests[subjects[0]]["summary"][mode]["per_seed"][str(seeds[0])]
@@ -235,11 +240,13 @@ def run(args: argparse.Namespace) -> dict:
             subject=subject,
             bundle_manifest=None,
             checkpoint_root=None,
+            truth_manifest=None,
             inventory_contract=None,
             output_root=child_root,
             device=args.device,
             seeds=list(seeds),
             verbose=False,
+            legacy_event_reconstruction=False,
         )
         run_single_subject(child_args)
         child_manifest_path = child_root / "run_manifest.json"
@@ -267,7 +274,7 @@ def run(args: argparse.Namespace) -> dict:
     scope_id = "s01_s09" if full_scope else "subset_" + "_".join(
         f"s{subject:02d}" for subject in subjects
     ) + "_seeds_" + "_".join(map(str, seeds))
-    protocol_id = f"bnci2014001_{scope_id}_epoch50_causal_single_window_oof_v1"
+    protocol_id = f"bnci2014001_{scope_id}_epoch50_causal_single_window_oof_v3"
     log_path = output_root / "run_log.json"
     atomic_json(log_path, {
         "status": "PASS",

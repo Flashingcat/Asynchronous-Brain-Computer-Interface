@@ -1,0 +1,60 @@
+{
+  "protocol_id": "bnci2014001_s09_session0_causal_online_v3",
+  "subject": 9,
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "native_sampling_rate": 250,
+  "window_samples": 500,
+  "step_samples": 125,
+  "event_margin_samples": 125,
+  "source_bundle": {
+    "protocol_id": "bnci2014001_s09_oof_train_session0_native250_v1",
+    "manifest_sha256": "8a713affadb27d394cdc7a049973dd2eec2478d524a2d6eec8762d71d6bff0af",
+    "index_sha256": "6db4bc6da7456ed9251cf77c61914ffaf2f5b627b65cf87839543f83e84818eb"
+  },
+  "derivation": {
+    "segments": "causal segment formal_start_native to formal_stop_native",
+    "windows": "start at each formal segment start; 500 samples; 125-sample step; reindex from zero",
+    "events": "read every clean session0 event from the independent truth table",
+    "event_id": "s0_r{run}_t{trial}"
+  },
+  "inventory": {
+    "segment_count": 55,
+    "segment_inventory_sha256": "faaf506e81f45de41b65b25e8052951a2019ebca02ca8cd48ab9e64cc8990929",
+    "fully_warmup_excluded_segment_count": 2,
+    "fully_warmup_excluded_samples": 500,
+    "zero_window_segment_count": 16,
+    "zero_window_segment_samples": 3284,
+    "trailing_unwindowed_samples": 2376,
+    "window_count": 3755,
+    "window_inventory_sha256": "bfecf5a1f9e420d827a7819334a76721f5944f8292cffe221393721f08e448ec",
+    "event_count": 237,
+    "event_inventory_sha256": "c5cb07eb6696154f8b51dcc9b890bdd3b3521b9c3d075606f2baee0e6ecea8b9",
+    "valid_idle_seconds": 1010.64
+  },
+  "per_run_window_count": {
+    "0": 585,
+    "1": 585,
+    "2": 649,
+    "3": 666,
+    "4": 606,
+    "5": 664
+  },
+  "per_run_event_count": {
+    "0": 37,
+    "1": 37,
+    "2": 41,
+    "3": 42,
+    "4": 38,
+    "5": 42
+  },
+  "event_source": "explicit_session0_clean_event_table",
+  "source_truth": {
+    "protocol_id": "bnci2014001_s09_session0_clean_event_truth_native250_v1",
+    "manifest_sha256": "67ad875919f62a79589517399a1ae33f497a7b91b7a576ddd7dae94371d2589a",
+    "event_file_sha256": "740e1da3bab4c73f8411cd763186b060b6449a16f2ce7757da221bfaca33e9d6"
+  },
+  "artifact_policy": "official_trial_exclusion",
+  "segment_policy": "separate_clean_segments_no_time_compression",
+  "artifact_policy_binding": "legacy_v1_protocol_contract"
+}

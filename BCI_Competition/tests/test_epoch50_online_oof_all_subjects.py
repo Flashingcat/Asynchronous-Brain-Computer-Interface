@@ -81,6 +81,15 @@ class SubjectMacroTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "manifest 合同非法"):
             aggregate_subject_summaries(manifests, (1,), (42,))
 
+    def test_inventory_contract_versions_cannot_be_mixed(self) -> None:
+        manifests = {
+            1: fake_manifest(1, {42: 0.5}),
+            2: fake_manifest(2, {42: 0.5}),
+        }
+        manifests[2]["protocol_id"] = manifests[2]["protocol_id"].replace("_v1", "_v3")
+        with self.assertRaisesRegex(RuntimeError, "不得混用"):
+            aggregate_subject_summaries(manifests, (1, 2), (42,))
+
 
 if __name__ == "__main__":
     unittest.main()

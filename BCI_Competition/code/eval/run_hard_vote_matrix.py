@@ -203,10 +203,13 @@ def verify_input_root(input_root: Path) -> tuple[dict, dict[int, dict]]:
 
 # ---------- 单被试重放：从 session0-only bundle 恢复真值库存，从 NPZ 只读取 logits ----------
 def _load_subject_inventory(subject: int):
+    """硬投票 v1 只复核历史输入；新策略必须改用独立真值侧车。"""
     paths = default_subject_paths(subject)
     context = load_bundle(paths.bundle_manifest)
-    inventory = build_online_inventory(context)
-    contract = _read_json(paths.inventory_contract)
+    inventory = build_online_inventory(
+        context, allow_legacy_event_reconstruction=True,
+    )
+    contract = _read_json(paths.legacy_inventory_contract)
     verify_inventory_contract(context, inventory, contract)
     return context, inventory, contract, paths
 
@@ -557,8 +560,8 @@ def run(args: argparse.Namespace) -> dict:
             "completed_at_utc": subject_completed,
             "input_child_manifest": display_path(input_child_path),
             "input_child_manifest_sha256": file_hash(input_child_path),
-            "inventory_contract": display_path(paths.inventory_contract),
-            "inventory_contract_sha256": file_hash(paths.inventory_contract),
+            "inventory_contract": display_path(paths.legacy_inventory_contract),
+            "inventory_contract_sha256": file_hash(paths.legacy_inventory_contract),
             "vote_grid": [list(item) for item in VOTE_GRID],
             "runtime_environment": run_environment,
             "seed_artifacts": seed_artifacts,

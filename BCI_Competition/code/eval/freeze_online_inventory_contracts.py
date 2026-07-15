@@ -1,4 +1,4 @@
-"""从各被试 session0-only bundle 冻结连续在线评分库存合同。"""
+"""从 session0-only bundle 与独立事件真值侧车冻结连续在线评分库存合同。"""
 
 from __future__ import annotations
 
@@ -20,25 +20,43 @@ from run_epoch50_online_oof import (
     inventory_contract_protocol_id,
     verify_inventory_contract,
 )
+from online_truth_inventory import (  # noqa: E402
+    EXPLICIT_EVENT_SOURCE,
+    load_truth_inventory,
+)
 from oof_training_bundle import BUNDLE_ID, artifact_contract, load_bundle
 
 
-# ---------- 路径版本：默认复核历史 v1，显式 bundle-root 则读取新建的 v2 bundle ----------
+# ---------- 路径版本：bundle 可为历史 v1 或新建 v2，事件来源另行决定合同版本 ----------
 def resolve_bundle_manifest(subject: int, bundle_root: Path | None) -> Path:
     if bundle_root is None:
         return default_subject_paths(subject).bundle_manifest.resolve()
     return (Path(bundle_root).resolve() / BUNDLE_ID.format(subject=subject) / "manifest.json")
 
 
-# ---------- 合同派生：只使用 session0 冻结 bundle，不访问原始 MAT 或测试 session ----------
-def derive_contract(subject: int, bundle_manifest: Path | None = None) -> dict:
+# ---------- 合同派生：运行时只读 session0 bundle 与真值侧车，不回访 MAT 或测试 session ----------
+def derive_contract(
+    subject: int,
+    bundle_manifest: Path | None = None,
+    truth_manifest: Path | None = None,
+    legacy_event_reconstruction: bool = False,
+) -> dict:
     manifest_path = (
         default_subject_paths(subject).bundle_manifest
         if bundle_manifest is None else Path(bundle_manifest)
     ).resolve()
     context = load_bundle(manifest_path, verify_hashes=True)
     artifact_identity = artifact_contract(context.manifest)
-    inventory = build_online_inventory(context)
+    truth = None
+    if not legacy_event_reconstruction:
+        truth_path = Path(
+            truth_manifest or default_subject_paths(subject).truth_manifest,
+        ).resolve()
+        truth = load_truth_inventory(truth_path, context)
+    inventory = build_online_inventory(
+        context, truth,
+        allow_legacy_event_reconstruction=legacy_event_reconstruction,
+    )
     no_command = [
         DecisionRecord(
             *window.key, window.window_index,
@@ -62,7 +80,9 @@ def derive_contract(subject: int, bundle_manifest: Path | None = None) -> dict:
         raise RuntimeError(f"Subject {subject} 的 NO_COMMAND 库存控制失败")
 
     contract = {
-        "protocol_id": inventory_contract_protocol_id(context.manifest),
+        "protocol_id": inventory_contract_protocol_id(
+            context.manifest, inventory.event_source,
+        ),
         "subject": subject,
         "included_session": 0,
         "test_session_access": "forbidden",
@@ -78,7 +98,11 @@ def derive_contract(subject: int, bundle_manifest: Path | None = None) -> dict:
         "derivation": {
             "segments": "causal segment formal_start_native to formal_stop_native",
             "windows": "start at each formal segment start; 500 samples; 125-sample step; reindex from zero",
-            "events": "group the five clean task windows by run, segment and trial; onset=min(start); offset=max(stop)",
+            "events": (
+                "read every clean session0 event from the independent truth table"
+                if inventory.event_source == EXPLICIT_EVENT_SOURCE
+                else "group the five clean task windows by run, segment and trial; onset=min(start); offset=max(stop)"
+            ),
             "event_id": "s0_r{run}_t{trial}",
         },
         "inventory": {
@@ -106,8 +130,18 @@ def derive_contract(subject: int, bundle_manifest: Path | None = None) -> dict:
             for run in range(6)
         },
     }
-    # 历史 v1 文件保持逐字兼容；新建 v2 必须把伪迹和 segment 合同写入库存本身。
-    if artifact_identity["artifact_policy_binding"] == "explicit_bundle_manifest":
+    if inventory.event_source == EXPLICIT_EVENT_SOURCE:
+        contract.update({
+            "event_source": inventory.event_source,
+            "source_truth": {
+                "protocol_id": truth.manifest["protocol_id"],
+                "manifest_sha256": truth.manifest_sha256,
+                "event_file_sha256": truth.event_file_sha256,
+            },
+            **artifact_identity,
+        })
+    # 历史 v1 文件保持逐字兼容；旧 v2 仍显式记录伪迹和 segment 合同。
+    elif artifact_identity["artifact_policy_binding"] == "explicit_bundle_manifest":
         contract.update(artifact_identity)
     return contract
 
@@ -118,9 +152,13 @@ def freeze_or_verify(
     write_missing: bool,
     bundle_root: Path | None = None,
     output_dir: Path | None = None,
+    truth_manifest: Path | None = None,
+    legacy_event_reconstruction: bool = False,
 ) -> dict:
     bundle_manifest = resolve_bundle_manifest(subject, bundle_root)
-    derived = derive_contract(subject, bundle_manifest)
+    derived = derive_contract(
+        subject, bundle_manifest, truth_manifest, legacy_event_reconstruction,
+    )
     contract_dir = (
         default_subject_paths(subject).inventory_contract.parent
         if output_dir is None else Path(output_dir)
@@ -141,7 +179,17 @@ def freeze_or_verify(
 
     # 写后再次走正式运行器的合同验证，防止生成器与消费端接口漂移。
     context = load_bundle(bundle_manifest, verify_hashes=True)
-    verify_inventory_contract(context, build_online_inventory(context), derived)
+    truth = (
+        None if legacy_event_reconstruction
+        else load_truth_inventory(
+            Path(truth_manifest or default_subject_paths(subject).truth_manifest), context,
+        )
+    )
+    inventory = build_online_inventory(
+        context, truth,
+        allow_legacy_event_reconstruction=legacy_event_reconstruction,
+    )
+    verify_inventory_contract(context, inventory, derived)
     return {
         "subject": subject,
         "action": action,
@@ -161,7 +209,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir", type=Path,
-        help="库存合同输出目录；文件名由 v1/v2 协议身份自动确定",
+        help="库存合同输出目录；文件名由 legacy v1/v2 或显式真值 v3/v4 自动确定",
+    )
+    parser.add_argument(
+        "--truth-root", type=Path,
+        help="独立真值库存父目录；缺省读取 data/processed 中的正式侧车",
+    )
+    parser.add_argument(
+        "--legacy-event-reconstruction", action="store_true",
+        help="仅复核历史 v1/v2 合同，不得用于新运行",
     )
     parser.add_argument("--write-missing", action="store_true")
     return parser.parse_args()
@@ -174,7 +230,17 @@ if __name__ == "__main__":
         raise ValueError(f"subjects 只能取 {KNOWN_SUBJECTS}")
     records = [
         freeze_or_verify(
-            subject, args.write_missing, args.bundle_root, args.output_dir,
+            subject,
+            args.write_missing,
+            args.bundle_root,
+            args.output_dir,
+            (
+                None if args.truth_root is None
+                else args.truth_root / (
+                    f"bnci2014001_s{subject:02d}_session0_clean_event_truth_native250_v1"
+                ) / "manifest.json"
+            ),
+            args.legacy_event_reconstruction,
         )
         for subject in subjects
     ]
