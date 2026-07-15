@@ -14,6 +14,7 @@ MODEL_DIR = PROJECT_ROOT / "code" / "models" / "models"
 
 MODEL_SPECS = {
     "eegnet": ("eegnet.py", "EEGNetClassifier"),
+    "eegnet_attn": ("eegnet_attn.py", "EEGNetAttnClassifier"),
     "shallowconvnet": ("shallowconvnet.py", "ShallowConvNetClassifier"),
     "deepcnn": ("deepcnn.py", "DeepCNNClassifier"),
     "conformer": ("conformer.py", "ConformerClassifier"),
