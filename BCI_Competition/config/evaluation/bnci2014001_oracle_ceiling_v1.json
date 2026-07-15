@@ -1,0 +1,43 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_oracle_ceiling_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "selection_status": "diagnostic_only_no_policy_selection",
+  "anchor_cell": "c055_r020_l1",
+  "truth_load_phase": "after_all_frozen_logits_and_model_only_anchor_traces",
+  "component_axes": {
+    "stage1": {
+      "model": "anchor Stage 1 EWMA opening and holding evidence",
+      "truth_oracle": "Task on every officially eligible event window; otherwise IDLE"
+    },
+    "commit": {
+      "model": "commit the first legal candidate-local Stage 2 crossing with at least two windows, top probability at least 0.55, gap at least 0.15, and current raw top1 equal to aggregate top1",
+      "truth_oracle": "dynamic program may skip crossings and commit only the same legal crossing whose model aggregate top1 equals the event true class"
+    },
+    "reset": {
+      "model": "anchor Stage 1 Task probability at most 0.20 for one WAIT_IDLE window",
+      "truth_oracle": "first WAIT_IDLE window whose decision time is strictly after true MI end; an idle false command may reset on its following true-IDLE window"
+    }
+  },
+  "dynamic_program_objective": [
+    "maximize correctly submitted unique events over each full segment",
+    "minimize total correct-event latency in native samples",
+    "minimize emitted commands",
+    "choose lexicographically earlier command windows"
+  ],
+  "stage2_evidence_ceilings": {
+    "raw_top1": "any officially eligible raw Stage 2 window has fixed-order top1 equal to truth",
+    "any_start_causal_ewma_top1": "alpha 0.5 causal EWMA from any officially eligible start has fixed-order top1 equal to truth",
+    "convex_logit_top1": "some nonnegative sum-to-one weighting of the eligible prefix makes truth a co-top class"
+  },
+  "event_matching": {
+    "native_sampling_rate": 250,
+    "window_samples": 500,
+    "step_samples": 125,
+    "minimum_overlap_samples": 125,
+    "window_stop_must_not_exceed_event_offset": true
+  },
+  "aggregation": "equal-subject macro within each paired seed, then mean and population standard deviation across seeds 42 43 44",
+  "claim_limit": "truth-aware post-inference upper-bound diagnostic; not deployable performance, FAR, or a policy-selection result"
+}
