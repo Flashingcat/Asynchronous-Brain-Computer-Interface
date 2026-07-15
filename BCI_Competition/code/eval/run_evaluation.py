@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,7 @@ STRIDE_SECONDS = 0.5
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="eegnet_attn", choices=available_models())
+    parser.add_argument("--model", default="eegnet", choices=available_models())
     parser.add_argument("--threshold", type=float, default=0.0, help="confidence threshold (reject below)")
     return parser.parse_args()
 
@@ -389,6 +390,41 @@ def bootstrap_event_rates(labels: np.ndarray, predictions: np.ndarray,
     }
 
 
+def compute_model_stats(data: dict) -> dict:
+    """Count parameters and measure inference speed."""
+    binary_params = sum(p.numel() for p in data["binary_model"].parameters())
+    mi_params = sum(p.numel() for p in data["mi_model"].parameters())
+    total_params = binary_params + mi_params
+
+    # Inference speed: time for the whole test set
+    features = data["features"].to(data["device"])
+    n_windows = features.shape[0]
+
+    # Warmup
+    _ = data["binary_model"](features[:32])
+    _ = data["mi_model"](features[:32])
+
+    torch.cuda.synchronize() if data["device"].type == "cuda" else None
+    start = time.perf_counter()
+    _ = data["binary_model"](features)
+    _ = data["mi_model"](features)
+    torch.cuda.synchronize() if data["device"].type == "cuda" else None
+    elapsed = time.perf_counter() - start
+
+    windows_per_second = n_windows / elapsed
+    seconds_per_100_windows = 100.0 / windows_per_second
+
+    return {
+        "params_binary_stage": binary_params,
+        "params_mi_stage": mi_params,
+        "params_total": total_params,
+        "inference_windows_per_second": round(windows_per_second, 1),
+        "inference_seconds_per_100_windows": round(seconds_per_100_windows, 3),
+        "inference_total_seconds": round(elapsed, 3),
+        "n_test_windows": n_windows,
+    }
+
+
 def threshold_sweep(labels: np.ndarray, bin_probs: np.ndarray, mi_probs: np.ndarray,
                     n_thresholds: int = 20) -> dict:
     """Sweep confidence thresholds and compute TPR/FPR trade-off curve."""
@@ -461,6 +497,9 @@ def main():
     # Threshold sweep / ROC analysis
     report["threshold_analysis"] = threshold_sweep(data["labels"], bin_probs, mi_probs)
 
+    # Model efficiency
+    report["model_stats"] = compute_model_stats(data)
+
     # Print summary
     print("\n" + "=" * 50)
     print(f"Event-Level Evaluation: {args.model}")
@@ -528,6 +567,17 @@ def main():
     for p in ta["curve"]:
         marker = " (best)" if p["threshold"] == ta["youden_threshold"] else ""
         print(f"    thresh={p['threshold']:.2f}  ->  TPR={p['tpr']:.3f}  FPR={p['fpr']:.3f}{marker}")
+
+    # === Model Efficiency ===
+    print("\n" + "-" * 50)
+    print("Model Efficiency:")
+    print("-" * 50)
+    ms = report["model_stats"]
+    print(f"  Parameters (total):     {ms['params_total']:,}")
+    print(f"    Stage 1 binary:       {ms['params_binary_stage']:,}")
+    print(f"    Stage 2 MI:           {ms['params_mi_stage']:,}")
+    print(f"  Inference speed:        {ms['inference_windows_per_second']:.0f} windows/sec")
+    print(f"                          ({ms['inference_seconds_per_100_windows']:.3f}s per 100 windows)")
 
     # Save
     TABLE_DIR.mkdir(parents=True, exist_ok=True)
