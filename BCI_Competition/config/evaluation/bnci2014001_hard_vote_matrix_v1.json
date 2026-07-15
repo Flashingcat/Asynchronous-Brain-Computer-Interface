@@ -1,0 +1,27 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_hard_vote_matrix_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "joint_hard_labels": {
+    "0": "Stage 1 argmax is IDLE",
+    "1_to_4": "Stage 1 argmax is Task and Stage 2 argmax class is 1..4",
+    "argmax_tie_rule": "smallest class index"
+  },
+  "window_counts": [2, 3, 4, 5],
+  "vote_thresholds": {
+    "2": [2],
+    "3": [2, 3],
+    "4": [3, 4],
+    "5": [3, 4, 5]
+  },
+  "require_full_buffer": true,
+  "same_n_k_for_mi_and_idle": true,
+  "cache_reset": [
+    "segment_start",
+    "ready_to_wait_idle_after_mi_output",
+    "wait_idle_to_ready_after_idle_confirmation"
+  ],
+  "single_window_reference": "reuse frozen N=1 stateful strict result",
+  "selection_status": "none_all_cells_reported"
+}
