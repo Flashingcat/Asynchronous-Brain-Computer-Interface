@@ -54,14 +54,15 @@ python BCI_Competition/code/eval/run_evaluation.py --model eegnet
 
 ## 可用模型
 
-| 模型 | 特点 | 参数量 |
-|------|------|--------|
-| eegnet | 轻量 CNN 基线 | 最轻 |
-| eegnet_attn | EEGNet + 通道注意力 | 轻 |
-| shallowconvnet | 浅层卷积网络 | 轻 |
-| deepcnn | 深层卷积网络 | 中 |
-| conformer | CNN + Transformer | 重 |
-| deformer | 纯 Transformer | 重 |
+| 模型 | 特点 | 参数量 | 正确率 | FP/min | Kappa | 综合分 |
+|------|------|:------:|:------:|:------:|:-----:|:------:|
+| conformer | CNN + Transformer | 313K | 95.1% | 49.70 | **0.527** | **0.592** |
+| eegnet_attn | EEGNet + 通道注意力 | 10K | **97.3%** | 57.27 | 0.496 | **0.592** |
+| eegnet | 轻量 CNN 基线 | **4K** | 91.5% | 50.20 | 0.477 | 0.570 |
+| deepcnn | 深层卷积网络 | 163K | 85.3% | 32.22 | 0.464 | 0.545 |
+| shallowconvnet | 浅层卷积网络 | 1,058K | 85.3% | **26.57** | 0.454 | 0.542 |
+| deformer | 纯 Transformer | — | 83.0% | 96.67 | 0.324 | 0.497 |
+| dbconformer | 双分支 Conformer | — | — | — | — | — |
 
 ## 评估指标
 
