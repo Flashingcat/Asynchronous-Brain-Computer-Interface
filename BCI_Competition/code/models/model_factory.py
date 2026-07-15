@@ -95,6 +95,10 @@ def normalize_model_name(model_name: str) -> str:
         "dbconfrmer": "dbconformer",
     }
     key = aliases.get(key, key)
+    # 原始名称（含下划线）优先匹配，避免 normalize 去掉下划线后匹配不上。
+    raw = model_name.lower()
+    if key not in MODEL_SPECS and raw in MODEL_SPECS:
+        key = raw
     if key not in MODEL_SPECS:
         choices = ", ".join(available_models())
         raise ValueError(f"Unknown model '{model_name}'. Available models: {choices}")
