@@ -63,20 +63,22 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_session_split(data_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_session_split(data_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     with np.load(data_file) as data:
         features = data["X"].astype(np.float32)
         labels = data["y"].astype(np.int64)
         split = data["split"].astype(np.int64)
 
-    train_mask, test_mask = split == 0, split == 1
+    train_mask = split == 0
+    val_mask = split == 1
+    test_mask = split == 2 if np.any(split == 2) else split == 1
     if not train_mask.any() or not test_mask.any():
-        raise RuntimeError("Expected both train (0) and test (1) session windows.")
+        raise RuntimeError("Expected train (0) and held-out test/validation windows.")
 
     mean = features[train_mask].mean(axis=(0, 2), keepdims=True)
     std = features[train_mask].std(axis=(0, 2), keepdims=True).clip(min=1e-6)
     normalized = (features - mean) / std
-    return normalized, labels, train_mask, test_mask, np.stack((mean, std))
+    return normalized, labels, train_mask, val_mask, test_mask, np.stack((mean, std))
 
 
 def class_weights(labels: np.ndarray, num_classes: int, device: torch.device, mode: str) -> torch.Tensor | None:
@@ -183,6 +185,7 @@ def save_artifacts(
     args: argparse.Namespace,
     device: torch.device,
     train_count: int,
+    val_count: int,
     test_count: int,
 ) -> None:
     model_name = normalize_model_name(args.model)
@@ -229,7 +232,7 @@ def save_artifacts(
         "checkpoint_file": checkpoint_file.as_posix(),
         "prediction_file": prediction_file.as_posix(),
         "metrics_file": metrics_file.as_posix(),
-        "split": "session train (0) -> session test (1)",
+        "split": "0 train, 1 validation, 2 test; if split 2 is absent, split 1 is used as held-out evaluation",
         "label_mapping": {
             "stage1": {"0": "idle", "1": "task"},
             "stage2": {"0": "left_hand", "1": "right_hand", "2": "feet", "3": "tongue"},
@@ -243,6 +246,7 @@ def save_artifacts(
         "class_weight": args.class_weight,
         "device": str(device),
         "n_train": train_count,
+        "n_val": val_count,
         "n_test": test_count,
     }
     manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -257,8 +261,9 @@ def main() -> None:
     args.model = normalize_model_name(args.model)
     set_seed(args.seed)
 
-    features, labels, train_mask, test_mask, mean_std = load_session_split(DATA_FILE)
+    features, labels, train_mask, val_mask, test_mask, mean_std = load_session_split(DATA_FILE)
     train_task_mask = train_mask & (labels > 0)
+    val_task_mask = val_mask & (labels > 0)
     test_task_mask = test_mask & (labels > 0)
     if not train_task_mask.any() or not test_task_mask.any():
         raise RuntimeError("Expected task windows in both train and test splits.")
@@ -295,6 +300,36 @@ def main() -> None:
         args.learning_rate,
         class_weights(mi_train_y, 4, device, args.class_weight),
     )
+
+    if val_mask.any():
+        val_features = features[val_mask]
+        val_labels = labels[val_mask]
+        val_binary_true = (val_labels > 0).astype(np.int64)
+        val_binary_pred, val_final_pred = hierarchical_predict(binary_model, mi_model, val_features, device)
+        val_mi_true = labels[val_task_mask] - 1
+        val_mi_pred = predict(mi_model, features[val_task_mask], device) if val_task_mask.any() else np.asarray([], dtype=np.int64)
+        val_metrics = {
+            "final_5class": compute_metrics(val_labels, val_final_pred, FINAL_CLASS_NAMES),
+            "stage1_binary": compute_metrics(val_binary_true, val_binary_pred, BINARY_CLASS_NAMES),
+        }
+        if val_task_mask.any():
+            val_metrics["stage2_mi_on_true_task_windows"] = compute_metrics(val_mi_true, val_mi_pred, MI_CLASS_NAMES)
+        print(
+            "Validation final 5-class "
+            f"accuracy={val_metrics['final_5class']['accuracy']:.3f}; "
+            f"balanced_accuracy={val_metrics['final_5class']['balanced_accuracy']:.3f}"
+        )
+        print(
+            "Validation stage1 binary "
+            f"accuracy={val_metrics['stage1_binary']['accuracy']:.3f}; "
+            f"balanced_accuracy={val_metrics['stage1_binary']['balanced_accuracy']:.3f}"
+        )
+        if "stage2_mi_on_true_task_windows" in val_metrics:
+            print(
+                "Validation stage2 MI "
+                f"accuracy={val_metrics['stage2_mi_on_true_task_windows']['accuracy']:.3f}; "
+                f"balanced_accuracy={val_metrics['stage2_mi_on_true_task_windows']['balanced_accuracy']:.3f}"
+            )
 
     test_features = features[test_mask]
     test_labels = labels[test_mask]
@@ -338,6 +373,7 @@ def main() -> None:
         args,
         device,
         int(train_mask.sum()),
+        int(val_mask.sum()),
         int(test_mask.sum()),
     )
 

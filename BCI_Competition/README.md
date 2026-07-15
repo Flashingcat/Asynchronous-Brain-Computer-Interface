@@ -23,9 +23,13 @@ BCI_Competition/
     datasets/
       download_bnci2014001.py
       download_zhou2014.py
-    preprocessing/        正式索引、信号、滤波、fold、标准化和 bundle 构建
-    train/                正式 OOF 训练器及 legacy 训练器
-    eval/                 正式在线评估、策略矩阵及 legacy 评估器
+    preprocessing/
+      build_async_windows.py
+      build_zhou2014_windows.py
+    train/
+      train_eegnet_async.py
+    eval/
+      evaluate_async.py
     models/
       model_factory.py
       models/
@@ -196,7 +200,7 @@ BCI_Competition\data\processed\bnci2014001_subject01_async.json
 ```text
 X      EEG 窗口数据，形状为 (n_windows, 22, 256)
 y      标签，0 idle / 1 left_hand / 2 right_hand / 3 feet / 4 tongue
-split  划分标记，0 train / 1 test
+split  划分标记，0 train / 1 validation / 2 test
 ```
 
 当前窗口规则：
@@ -210,11 +214,67 @@ idle: 所有不与任务态重叠的 2s 窗口
 跨边界窗口: 丢弃，不参与训练
 ```
 
-训练/测试划分使用原始 session：
+训练/验证/测试划分：
 
 ```text
-train session -> split = 0
-test session  -> split = 1
+train session 中 1 个 run -> split = 1 validation
+train session 其余 run   -> split = 0 train
+test session 全部 run     -> split = 2 test
+```
+
+默认使用 train session 的最后一个 run 做验证集：
+
+```bat
+python BCI_Competition\code\preprocessing\build_async_windows.py --val-run-index -1
+```
+
+### Zhou2014/Zhou2016 预处理
+
+Zhou 数据集预处理入口：
+
+```bat
+python BCI_Competition\code\preprocessing\build_zhou2014_windows.py
+```
+
+默认处理全部 subject，并且每个 subject 使用 1 个 run 作为验证集，其余 run 作为训练集：
+
+```text
+split = 0  train
+split = 1  validation
+```
+
+默认验证 run 是每个 subject 的最后一个 run：
+
+```bat
+python BCI_Competition\code\preprocessing\build_zhou2014_windows.py --val-run-index -1
+```
+
+也可以指定第 1 个 run 作为验证集：
+
+```bat
+python BCI_Competition\code\preprocessing\build_zhou2014_windows.py --val-run-index 0
+```
+
+只处理部分 subject：
+
+```bat
+python BCI_Competition\code\preprocessing\build_zhou2014_windows.py --subjects 1 2 --val-run-index -1
+```
+
+生成文件：
+
+```text
+BCI_Competition\data\processed\zhou2014_async.npz
+BCI_Competition\data\processed\zhou2014_async.json
+```
+
+`.npz` 中包含：
+
+```text
+X        EEG 窗口数据
+y        标签，0 idle / 1 left_hand / 2 right_hand / 3 feet
+split    0 train / 1 validation
+subject  每个窗口对应的 subject id
 ```
 
 ## Legacy 128 Hz 模型训练（非正式）

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,17 @@ STRIDE_SECONDS = 0.5
 CUE_CODES = {"left_hand": 1, "right_hand": 2, "feet": 3, "tongue": 4}
 CLASS_NAMES = ["idle", "left_hand", "right_hand", "feet", "tongue"]
 TASK_SECONDS = 4.0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--val-run-index",
+        type=int,
+        default=-1,
+        help="run index from the train session used as validation; supports negative indexing",
+    )
+    return parser.parse_args()
 
 
 def configure_data_cache(data_root: Path) -> None:
@@ -67,35 +79,56 @@ def build_run_windows(raw: mne.io.BaseRaw) -> tuple[list[np.ndarray], list[int]]
     return samples, labels
 
 
-def build_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load BNCI subject 1 and keep the two recording sessions separate."""
+def choose_validation_run(run_names: list[str], val_run_index: int) -> str:
+    if not run_names:
+        raise RuntimeError("Cannot choose a validation run from an empty train session.")
+    try:
+        return run_names[val_run_index]
+    except IndexError as exc:
+        raise ValueError(f"Validation run index {val_run_index} is out of range for {len(run_names)} runs.") from exc
+
+
+def build_dataset(val_run_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    """Load BNCI subject 1 and split train session into train/validation runs."""
     subject_data = BNCI2014_001().get_data(subjects=[1])[1]
     features: list[np.ndarray] = []
     labels: list[int] = []
     split_labels: list[int] = []
+    split_records: list[dict] = []
 
     for session_name, runs in subject_data.items():
-        session_features: list[np.ndarray] = []
-        session_labels: list[int] = []
-        for raw in runs.values():
+        run_names = list(runs)
+        validation_run = choose_validation_run(run_names, val_run_index) if "train" in session_name.lower() else None
+
+        for run_name, raw in runs.items():
             run_features, run_labels = build_run_windows(raw)
-            session_features.extend(run_features)
-            session_labels.extend(run_labels)
+            if "train" in session_name.lower():
+                split = 1 if run_name == validation_run else 0
+            else:
+                split = 2
 
-        split = 0 if "train" in session_name.lower() else 1
-        features.extend(session_features)
-        labels.extend(session_labels)
-        split_labels.extend([split] * len(session_labels))
-        print(f"{session_name}: windows={len(session_labels)} split={split}")
+            features.extend(run_features)
+            labels.extend(run_labels)
+            split_labels.extend([split] * len(run_labels))
+            split_records.append(
+                {
+                    "session": session_name,
+                    "run": run_name,
+                    "split": {0: "train", 1: "val", 2: "test"}[split],
+                    "windows": len(run_labels),
+                }
+            )
+            print(f"{session_name}/{run_name}: windows={len(run_labels)} split={split}")
 
-    return np.stack(features), np.asarray(labels, dtype=np.int64), np.asarray(split_labels, dtype=np.int64)
+    return np.stack(features), np.asarray(labels, dtype=np.int64), np.asarray(split_labels, dtype=np.int64), split_records
 
 
 def main() -> None:
+    args = parse_args()
     configure_data_cache(DATA_ROOT)
-    features, labels, split = build_dataset()
-    if not np.any(split == 0) or not np.any(split == 1):
-        raise RuntimeError("Expected separate train and test sessions; refusing a potentially leaky split.")
+    features, labels, split, split_records = build_dataset(args.val_run_index)
+    if not np.any(split == 0) or not np.any(split == 1) or not np.any(split == 2):
+        raise RuntimeError("Expected train (0), validation (1), and test (2) windows.")
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(OUTPUT_FILE, X=features, y=labels, split=split)
@@ -109,8 +142,12 @@ def main() -> None:
         "task_definition": "MOABB cue-onset to cue-onset+4s, corresponding to raw MAT trial 2-6s motor imagery",
         "idle_definition": "all 2s windows that do not overlap any task interval",
         "classes": CLASS_NAMES,
+        "split": "train-session run-level split: one run validation, remaining train-session runs train; official evaluation session test",
+        "val_run_index": args.val_run_index,
+        "split_records": split_records,
         "n_train": int((split == 0).sum()),
-        "n_test": int((split == 1).sum()),
+        "n_val": int((split == 1).sum()),
+        "n_test": int((split == 2).sum()),
     }
     METADATA_FILE.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Saved dataset: {OUTPUT_FILE}; X={features.shape}")
