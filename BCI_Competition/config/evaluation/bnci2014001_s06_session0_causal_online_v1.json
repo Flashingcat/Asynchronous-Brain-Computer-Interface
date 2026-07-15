@@ -1,0 +1,51 @@
+{
+  "protocol_id": "bnci2014001_s06_session0_causal_online_v1",
+  "subject": 6,
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "native_sampling_rate": 250,
+  "window_samples": 500,
+  "step_samples": 125,
+  "event_margin_samples": 125,
+  "source_bundle": {
+    "protocol_id": "bnci2014001_s06_oof_train_session0_native250_v1",
+    "manifest_sha256": "5d9d17374e8c3c109405526ed28229a3171a87e96153cfea9215087bf268730b",
+    "index_sha256": "dbe8f68df93f75c728b3a9ac4a7848aafef3a8b9a1d17020459f8a81a27f131d"
+  },
+  "derivation": {
+    "segments": "causal segment formal_start_native to formal_stop_native",
+    "windows": "start at each formal segment start; 500 samples; 125-sample step; reindex from zero",
+    "events": "group the five clean task windows by run, segment and trial; onset=min(start); offset=max(stop)",
+    "event_id": "s0_r{run}_t{trial}"
+  },
+  "inventory": {
+    "segment_count": 72,
+    "segment_inventory_sha256": "40f0e18ecb92a4685ed8de205c6ccdbbcb88ce83b5a5f279fad4102ceeffa417",
+    "fully_warmup_excluded_segment_count": 3,
+    "fully_warmup_excluded_samples": 750,
+    "zero_window_segment_count": 23,
+    "zero_window_segment_samples": 5963,
+    "trailing_unwindowed_samples": 3072,
+    "window_count": 3446,
+    "window_inventory_sha256": "3b023835f672bb747f888d60f4793fd6a3fa244a2fd92fb6b435b70fe6e0925a",
+    "event_count": 219,
+    "event_inventory_sha256": "f3b1072f8c35233056cfa43804323abcb56e5fde629505715ea95a16ee21c91b",
+    "valid_idle_seconds": 956.64
+  },
+  "per_run_window_count": {
+    "0": 684,
+    "1": 516,
+    "2": 550,
+    "3": 600,
+    "4": 647,
+    "5": 449
+  },
+  "per_run_event_count": {
+    "0": 43,
+    "1": 33,
+    "2": 35,
+    "3": 38,
+    "4": 41,
+    "5": 29
+  }
+}

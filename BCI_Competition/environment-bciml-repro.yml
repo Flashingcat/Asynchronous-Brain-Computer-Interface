@@ -1,0 +1,17 @@
+name: bciml-repro
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.20
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.11.0+cu128
+      - numpy==1.26.4
+      - scipy==1.15.2
+      - scikit-learn==1.5.2
+      - mne==1.11.0
+      - moabb==1.2.0
+      - mne-bids==0.17.0
+      - matplotlib==3.10.8
+      - einops==0.8.2

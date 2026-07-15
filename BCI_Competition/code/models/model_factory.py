@@ -9,8 +9,9 @@ from pathlib import Path
 import torch
 from torch import nn
 
-PROJECT_ROOT = Path("BCI_Competition") if Path("BCI_Competition/code/models/models").is_dir() else Path(".")
-MODEL_DIR = PROJECT_ROOT / "code" / "models" / "models"
+# 以源码位置定位模型，避免换电脑或从其他工作目录启动时依赖当前 cwd。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_DIR = Path(__file__).resolve().parent / "models"
 
 MODEL_SPECS = {
     "eegnet": ("eegnet.py", "EEGNetClassifier"),
@@ -119,7 +120,7 @@ def _load_model_class(model_name: str) -> type[nn.Module]:
         dependency = exc.name or "a model dependency"
         raise ModuleNotFoundError(
             f"Model '{model_name}' requires missing dependency '{dependency}'. "
-            "Install dependencies from BCI_Competition/environment.yml and try again."
+            "Install dependencies from BCI_Competition/environment-bciml-repro.yml and try again."
         ) from exc
     return getattr(module, class_name)
 

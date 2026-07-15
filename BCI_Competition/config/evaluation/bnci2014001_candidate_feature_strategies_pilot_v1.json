@@ -1,0 +1,88 @@
+{
+  "protocol_id": "bnci2014001_s01_seed42_candidate_feature_pilot_v1",
+  "input_protocol_id": "bnci2014001_s01_seed42_epoch50_feature_preflight_v1",
+  "subject": 1,
+  "seed": 42,
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "selection_status": "none_all_cells_reported",
+  "parameter_origin": "fixed after unlabeled S1 seed42 candidate-local Stage 2 feature scale inspection",
+  "strategy_semantics": {
+    "base_logit_policy": "dual_ewma_drop_abort from the frozen logit strategy matrix",
+    "feature_source": "Stage 2 flattened EEGNet block2 output before the linear classifier",
+    "feature_normalization": "each candidate window is independently L2-normalized",
+    "feature_history": "candidate-local, excludes opening window, clears on every candidate exit and segment boundary",
+    "feature_role": "veto Stage 2 commit only; never opens a candidate and never overrides Stage 1 abort",
+    "metric_order": "compare current feature with causal history before adding the current feature",
+    "threshold_comparison": "feature change uses <= and required consecutive passes use >=",
+    "reporting_scope": "S1 seed42 mechanism pilot only; no selected or unbiased strategy claim"
+  },
+  "base_logit_strategy": {
+    "strategy_id": "dual_ewma_drop_abort",
+    "stage1_filter": "ewma_margin",
+    "stage1_alpha": 0.5,
+    "stage1_window": null,
+    "task_on_probability": 0.5,
+    "task_hold_probability": 0.3,
+    "idle_reset_probability": 0.2,
+    "stage1_drop_abort": 0.2,
+    "stage2_filter": "candidate_ewma_centered_logits",
+    "stage2_alpha": 0.5,
+    "stage2_min_candidate_windows": 2,
+    "stage2_top_probability": 0.55,
+    "stage2_probability_gap": 0.15,
+    "stage2_stable_windows": 1,
+    "stage2_max_probability_curvature": null,
+    "max_candidate_windows": 8
+  },
+  "strategies": [
+    {
+      "strategy_id": "logit_only_reference",
+      "feature_metric": "none",
+      "feature_max_change": null,
+      "feature_required_consecutive": 0
+    },
+    {
+      "strategy_id": "velocity_loose",
+      "feature_metric": "unit_velocity_l2",
+      "feature_max_change": 1.2,
+      "feature_required_consecutive": 1
+    },
+    {
+      "strategy_id": "velocity_strict",
+      "feature_metric": "unit_velocity_l2",
+      "feature_max_change": 0.9,
+      "feature_required_consecutive": 1
+    },
+    {
+      "strategy_id": "velocity_consecutive",
+      "feature_metric": "unit_velocity_l2",
+      "feature_max_change": 1.2,
+      "feature_required_consecutive": 2
+    },
+    {
+      "strategy_id": "prototype_loose",
+      "feature_metric": "unit_prototype_cosine_distance",
+      "feature_max_change": 0.7,
+      "feature_required_consecutive": 1
+    },
+    {
+      "strategy_id": "prototype_strict",
+      "feature_metric": "unit_prototype_cosine_distance",
+      "feature_max_change": 0.4,
+      "feature_required_consecutive": 1
+    },
+    {
+      "strategy_id": "acceleration_loose",
+      "feature_metric": "unit_acceleration_l2",
+      "feature_max_change": 2.0,
+      "feature_required_consecutive": 1
+    },
+    {
+      "strategy_id": "acceleration_strict",
+      "feature_metric": "unit_acceleration_l2",
+      "feature_max_change": 1.5,
+      "feature_required_consecutive": 1
+    }
+  ]
+}

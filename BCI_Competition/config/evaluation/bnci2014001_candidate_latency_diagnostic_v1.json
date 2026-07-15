@@ -1,0 +1,41 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_candidate_latency_diagnostic_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "selection_status": "none_diagnostic_only",
+  "anchor": {
+    "source_config": "bnci2014001_commit_reset_matrix_v1.json",
+    "cell_id": "c055_r020_l1",
+    "reason": "historical dual_ewma_drop_abort regression anchor, not selected from this diagnostic"
+  },
+  "latency_clock": {
+    "sampling_rate": 250,
+    "window_samples": 500,
+    "step_samples": 125,
+    "definition": "decision_sample/250 - MI_onset_sample/250",
+    "causal_filter_group_delay": "included_and_not_subtracted",
+    "wall_clock_compute": "not_measured"
+  },
+  "truth_usage": "post_inference_oracle_diagnostics_only",
+  "oracles": [
+    "raw_correct_top1",
+    "raw_correct_confident",
+    "open_ewma_correct_top1",
+    "open_ewma_correct_confident_min1",
+    "open_ewma_correct_confident_min2"
+  ],
+  "label_free_first_crossings": [
+    "raw_first_confident",
+    "open_ewma_first_confident_min1",
+    "open_ewma_first_confident_min2"
+  ],
+  "label_free_scope": "class-label-free selection within post-inference truth-defined event onset/offset and margin",
+  "required_pairing": [
+    "same baseline-correct event latency headroom",
+    "baseline-miss correct-class post-MI spillover truth-aware rescue",
+    "baseline correct rate reported beside latency",
+    "WAIT_IDLE locked-event rates",
+    "truth oracle preceded by an earlier wrong label-free crossing"
+  ]
+}
