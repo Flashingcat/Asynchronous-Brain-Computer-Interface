@@ -30,6 +30,9 @@ from run_hard_vote_matrix import (  # noqa: E402
     CORE_FIELDS,
     FROZEN_INPUT_CHILD_SOURCE_SHA256,
     FROZEN_INPUT_MASTER_SOURCE_SHA256,
+    _portable_path_text,
+    _safe_artifact,
+    _seed_score_path,
     aggregate_subject_matrix,
     runtime_environment,
     validate_policy_config,
@@ -114,6 +117,36 @@ class HardVotePolicyTests(unittest.TestCase):
 
 
 class HardVoteMatrixContractTests(unittest.TestCase):
+    def test_frozen_windows_paths_are_portable_without_weakening_safety(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected = root / "subject_01" / "run_manifest.json"
+            expected.parent.mkdir()
+            expected.write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                _safe_artifact(root, r"subject_01\run_manifest.json"),
+                expected.resolve(),
+            )
+            self.assertEqual(
+                _portable_path_text(r"data\processed\bundle\manifest.json"),
+                "data/processed/bundle/manifest.json",
+            )
+            manifest = {
+                "seed_artifacts": {
+                    "42": {"scores_and_decisions": {"file": r"scores\seed42.npz"}},
+                },
+            }
+            self.assertEqual(
+                _seed_score_path(root, manifest, 42),
+                (root / "scores" / "seed42.npz").resolve(),
+            )
+            for unsafe in (
+                r"..\escape.json", r"C:\escape.json", r"C:escape.json",
+                r"\\host\share\x",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "产物路径非法"):
+                    _safe_artifact(root, unsafe)
+
     def test_child_manifest_requires_artifact_and_segment_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -43,6 +43,7 @@ from oof_training_bundle import (  # noqa: E402
 )
 from train_eegnet_oof import JobSpec, prepare_job_arrays  # noqa: E402
 from freeze_online_inventory_contracts import freeze_or_verify  # noqa: E402
+from online_truth_inventory import build_truth_inventory  # noqa: E402
 
 
 class RealOOFTrainingBundleTests(unittest.TestCase):
@@ -77,6 +78,9 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
         )
         cls.bundle_root = cls.manifest_path.parent
         cls.context = load_bundle(cls.manifest_path)
+        _, cls.truth_manifest = build_truth_inventory(
+            cls.index_dir, cls.manifest_path, cls.root / "truth", 1,
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -146,22 +150,35 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
             artifact_contract(missing_v2)
 
     def test_bundle_loader_opens_no_file_outside_isolated_root(self) -> None:
-        real_open = builtins.open
+        real_builtin_open = builtins.open
+        real_path_open = Path.open
         opened: list[Path] = []
 
-        def tracking_open(file, *args, **kwargs):
+        # Path.read_text 通过 Path.open，单独 patch builtins.open 会让隔离检查假通过。
+        def record_path(file) -> None:
             try:
                 opened.append(Path(file).resolve())
             except TypeError:
                 pass
-            return real_open(file, *args, **kwargs)
 
-        with patch("builtins.open", tracking_open):
+        def tracking_builtin_open(file, *args, **kwargs):
+            record_path(file)
+            return real_builtin_open(file, *args, **kwargs)
+
+        def tracking_path_open(path, *args, **kwargs):
+            record_path(path)
+            return real_path_open(path, *args, **kwargs)
+
+        with patch("builtins.open", tracking_builtin_open), patch.object(
+            Path, "open", tracking_path_open,
+        ):
             loaded = load_bundle(self.manifest_path, verify_hashes=True)
             loaded.stores["causal"].read_window(loaded.rows[0])
             loaded.stores["zero_phase"].read_window(loaded.rows[0])
         outside = [path for path in opened
                    if not path.is_relative_to(self.bundle_root.resolve())]
+        self.assertGreater(len(opened), 0, "监控未捕获任何文件，隔离测试无效")
+        self.assertIn(self.manifest_path.resolve(), opened)
         self.assertEqual(outside, [])
 
     def test_bundle_can_move_without_joint_upstream(self) -> None:
@@ -173,27 +190,38 @@ class RealOOFTrainingBundleTests(unittest.TestCase):
             self.assertEqual(signal.shape, (22, 500))
         self.assertTrue(np.array_equal(loaded.rows, self.context.rows))
 
-    def test_explicit_v2_bundle_freezes_independent_v2_inventory_contract(self) -> None:
-        """全新 bundle 不得复用仓库内锁定旧 manifest SHA 的 v1 库存文件。"""
-        output_dir = self.root / "v2_inventory_contracts"
+    def test_explicit_truth_freezes_v4_inventory_contract_for_v2_bundle(self) -> None:
+        """v2 bundle 与独立事件表组合必须使用 v4，不能覆盖历史 v3。"""
+        output_dir = self.root / "v4_inventory_contracts"
         created = freeze_or_verify(
             1, True, bundle_root=self.bundle_dir, output_dir=output_dir,
+            truth_manifest=self.truth_manifest,
         )
         contract_path = Path(created["contract"])
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
         self.assertEqual(created["action"], "created_missing")
         self.assertEqual(
             contract_path.name,
-            "bnci2014001_s01_session0_causal_online_v2.json",
+            "bnci2014001_s01_session0_causal_online_v4.json",
         )
+        self.assertEqual(contract["event_source"], "explicit_session0_clean_event_table")
         self.assertEqual(contract["artifact_policy"], "official_trial_exclusion")
         self.assertEqual(
             contract["artifact_policy_binding"], "explicit_bundle_manifest",
         )
         verified = freeze_or_verify(
             1, False, bundle_root=self.bundle_dir, output_dir=output_dir,
+            truth_manifest=self.truth_manifest,
         )
         self.assertEqual(verified["action"], "verified_existing")
+
+    def test_legacy_v2_contract_requires_explicit_compatibility_flag(self) -> None:
+        output_dir = self.root / "legacy_v2_inventory_contracts"
+        created = freeze_or_verify(
+            1, True, bundle_root=self.bundle_dir, output_dir=output_dir,
+            legacy_event_reconstruction=True,
+        )
+        self.assertTrue(Path(created["contract"]).name.endswith("_v2.json"))
 
     def test_copied_signal_hashes_and_fold_statistics_equal_sources(self) -> None:
         normalization_path = self.index_dir / (

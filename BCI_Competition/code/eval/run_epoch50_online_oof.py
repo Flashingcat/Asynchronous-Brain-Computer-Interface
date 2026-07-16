@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -32,11 +33,18 @@ for source_dir in (TRAIN_DIR, MODELS_DIR, EVAL_DIR):
 
 from model_factory import build_model  # noqa: E402
 from oof_training_bundle import (  # noqa: E402
+    LEGACY_BUNDLE_ID,
     BundleContext,
     artifact_contract,
     load_bundle,
     rows_for,
     window_identity_hash,
+)
+from online_truth_inventory import (  # noqa: E402
+    EXPLICIT_EVENT_SOURCE,
+    TRUTH_ID,
+    TruthInventory,
+    load_truth_inventory,
 )
 from protocol_metrics import (  # noqa: E402
     NATIVE_SAMPLING_RATE,
@@ -60,6 +68,18 @@ KNOWN_SEEDS = (42, 43, 44)
 KNOWN_SUBJECTS = tuple(range(1, 10))
 LEGACY_INVENTORY_ID = "bnci2014001_s{subject:02d}_session0_causal_online_v1"
 INVENTORY_ID = "bnci2014001_s{subject:02d}_session0_causal_online_v2"
+EXPLICIT_TRUTH_INVENTORY_ID = "bnci2014001_s{subject:02d}_session0_causal_online_v3"
+EXPLICIT_TRUTH_V2_BUNDLE_INVENTORY_ID = (
+    "bnci2014001_s{subject:02d}_session0_causal_online_v4"
+)
+LEGACY_EVENT_SOURCE = "legacy_task_window_reconstruction"
+TRUTH_LOAD_PHASE = "after_all_model_scores_and_decision_traces"
+# 历史 checkpoint 绑定旧 reader；当前 reader 只扩展 v1/v2 manifest 合同。
+# 兼容入口同时锁定旧源码、当前源码和两者的完整 unified diff，任一字节漂移即失败。
+LEGACY_READER_JOB_SHA256 = "f5a2deb40b64187dcbbce34b5e4c382ebb637177851776713eb96c4e99e80f56"
+AUDITED_READER_LF_SHA256 = "6c71f5c2647fa5b032087e08bbee2ae60e59400fe15afe27da7b821fd3a17066"
+AUDITED_READER_DIFF_SHA256 = "c0f4d9721b5f6db305100c0d48c0284817b70bfe5f74cc4183da7652826d9e87"
+AUDITED_READER_MATCH_MODE = "audited_v1_reader_contract_extension_v1"
 OUTPUT_WINDOW_DTYPE = np.dtype([
     ("subject_id", "u1"), ("session_id", "u1"), ("run_id", "u1"),
     ("segment_id", "u1"), ("window_index", "<u4"),
@@ -67,6 +87,17 @@ OUTPUT_WINDOW_DTYPE = np.dtype([
     ("window_start_model", "<i8"), ("window_stop_model", "<i8"),
     ("decision_time_seconds", "<f8"),
 ])
+
+
+@dataclass
+class OnlineSignalInventory:
+    """推理阶段唯一允许持有的 segment、窗口和匿名信号读取行。"""
+
+    segments: list[ScoringSegment]
+    windows: list[ExpectedWindow]
+    signal_rows: np.ndarray
+    fully_warmup_excluded_segment_count: int
+    fully_warmup_excluded_samples: int
 
 
 @dataclass
@@ -79,20 +110,26 @@ class OnlineInventory:
     signal_rows: np.ndarray
     fully_warmup_excluded_segment_count: int
     fully_warmup_excluded_samples: int
+    event_source: str
+    truth_protocol_id: str | None
+    truth_manifest_sha256: str | None
+    truth_event_file_sha256: str | None
 
 
 @dataclass(frozen=True)
 class SubjectPaths:
-    """单被试运行的四类输入/输出路径，集中定义以避免各入口命名漂移。"""
+    """单被试新合同路径；旧合同仅供历史结果逐字复核。"""
 
     bundle_manifest: Path
     checkpoint_root: Path
+    truth_manifest: Path
     inventory_contract: Path
+    legacy_inventory_contract: Path
     output_root: Path
 
 
 def default_subject_paths(subject: int) -> SubjectPaths:
-    """解析既有 v1 复现实物；全新显式合同流程必须通过 CLI 传入 v2 路径。"""
+    """新运行默认使用独立真值和 v3 合同，避免无意延续旧事件反推。"""
     if type(subject) is not int or subject not in KNOWN_SUBJECTS:
         raise ValueError(f"subject 只能取 {KNOWN_SUBJECTS}")
     checkpoint_name = (
@@ -106,13 +143,21 @@ def default_subject_paths(subject: int) -> SubjectPaths:
             / "manifest.json"
         ),
         checkpoint_root=PROJECT_ROOT / "results" / "checkpoints" / checkpoint_name,
+        truth_manifest=(
+            PROJECT_ROOT / "data" / "processed"
+            / TRUTH_ID.format(subject=subject) / "manifest.json"
+        ),
         inventory_contract=(
+            PROJECT_ROOT / "config" / "evaluation"
+            / f"bnci2014001_s{subject:02d}_session0_causal_online_v3.json"
+        ),
+        legacy_inventory_contract=(
             PROJECT_ROOT / "config" / "evaluation"
             / f"bnci2014001_s{subject:02d}_session0_causal_online_v1.json"
         ),
         output_root=(
             PROJECT_ROOT / "results" / "tables"
-            / f"s{subject:02d}_epoch50_causal_single_window_oof_v1"
+            / f"s{subject:02d}_epoch50_causal_single_window_oof_v3"
         ),
     )
 
@@ -126,15 +171,40 @@ def bundle_contract_version(manifest: dict) -> str:
     return "v2" if binding == "explicit_bundle_manifest" else "v1"
 
 
-def inventory_contract_protocol_id(manifest: dict) -> str:
-    """由 bundle 版本唯一确定在线库存合同协议名。"""
+def inventory_contract_protocol_id(
+    manifest: dict,
+    event_source: str = LEGACY_EVENT_SOURCE,
+) -> str:
+    """事件来源是合同的一部分；显式真值使用不与旧文件冲突的 v3/v4。"""
     subject = manifest["subject"]
+    if event_source == EXPLICIT_EVENT_SOURCE:
+        template = (
+            EXPLICIT_TRUTH_V2_BUNDLE_INVENTORY_ID
+            if bundle_contract_version(manifest) == "v2"
+            else EXPLICIT_TRUTH_INVENTORY_ID
+        )
+        return template.format(subject=subject)
+    if event_source != LEGACY_EVENT_SOURCE:
+        raise RuntimeError(f"未知在线事件来源: {event_source}")
     template = (
         INVENTORY_ID
         if bundle_contract_version(manifest) == "v2"
         else LEGACY_INVENTORY_ID
     )
     return template.format(subject=subject)
+
+
+def default_output_root_for_protocol(
+    subject: int,
+    manifest: dict,
+    event_source: str,
+) -> Path:
+    """从同一份库存协议派生默认输出后缀，防止目录名与清单版本分裂。"""
+    version = inventory_contract_protocol_id(manifest, event_source).rsplit("_", 1)[-1]
+    return (
+        PROJECT_ROOT / "results" / "tables"
+        / f"s{subject:02d}_epoch50_causal_single_window_oof_{version}"
+    )
 
 
 # ---------- 通用审计工具：所有外部输入和输出均以 SHA-256 绑定 ----------
@@ -155,6 +225,49 @@ def lf_normalized_hash(path: Path) -> str:
     """跨平台只放宽 CRLF/LF 差异，其他任意字节变化仍拒绝。"""
     normalized = Path(path).read_bytes().replace(b"\r\n", b"\n")
     return hashlib.sha256(normalized).hexdigest()
+
+
+def audited_reader_diff_hash(historical_path: Path, current_path: Path) -> str:
+    """对 LF 归一化源码生成固定标签的完整 diff，避免绝对路径污染审计哈希。"""
+    def normalized_lines(path: Path) -> list[str]:
+        payload = Path(path).read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+        return payload.splitlines(keepends=True)
+
+    difference = "".join(difflib.unified_diff(
+        normalized_lines(historical_path),
+        normalized_lines(current_path),
+        fromfile="historical/oof_training_bundle.py",
+        tofile="current/oof_training_bundle.py",
+        lineterm="\n",
+    )).encode("utf-8")
+    return hashlib.sha256(difference).hexdigest()
+
+
+def is_audited_legacy_reader_extension(
+    contract: dict,
+    snapshot_record: dict,
+    historical_path: Path,
+    current_path: Path,
+) -> bool:
+    """仅允许已审核的 v1 reader 合同扩展；v2 作业和未知 diff 不得借用。"""
+    job = contract.get("job", {})
+    subject = job.get("subject")
+    data = contract.get("data", {})
+    source = contract.get("source_sha256", {})
+    return bool(
+        type(subject) is int
+        and subject in KNOWN_SUBJECTS
+        and data.get("training_bundle_protocol_id")
+        == LEGACY_BUNDLE_ID.format(subject=subject)
+        and source.get("oof_training_bundle_reader") == LEGACY_READER_JOB_SHA256
+        and snapshot_record.get("job_sha256") == LEGACY_READER_JOB_SHA256
+        and snapshot_record.get("lf_normalized_sha256") == LEGACY_READER_JOB_SHA256
+        and file_hash(historical_path) == LEGACY_READER_JOB_SHA256
+        and lf_normalized_hash(historical_path) == LEGACY_READER_JOB_SHA256
+        and lf_normalized_hash(current_path) == AUDITED_READER_LF_SHA256
+        and audited_reader_diff_hash(historical_path, current_path)
+        == AUDITED_READER_DIFF_SHA256
+    )
 
 
 def display_path(path: Path) -> str:
@@ -228,6 +341,7 @@ def verify_model_sources(checkpoint_root: Path, contract: dict) -> str:
         or checkpoint_root.name not in covered_roots
     ):
         raise RuntimeError("post-hoc source snapshot 状态非法")
+    audited_reader_extension = False
     for role, path in source_paths.items():
         record = records.get(role, {})
         snapshot_path = snapshot_root / record.get("snapshot_path", "missing")
@@ -235,14 +349,57 @@ def verify_model_sources(checkpoint_root: Path, contract: dict) -> str:
             record.get("job_sha256") != expected.get(role)
             or not snapshot_path.is_file()
             or file_hash(snapshot_path) != expected.get(role)
-            or lf_normalized_hash(path) != record.get("lf_normalized_sha256")
         ):
             raise RuntimeError(f"{role} 不是可证明的 CRLF/LF 等价源码")
-    return "lf_normalized_equivalent_via_snapshot"
+        if lf_normalized_hash(path) == record.get("lf_normalized_sha256"):
+            continue
+        if role == "oof_training_bundle_reader" and is_audited_legacy_reader_extension(
+            contract, record, snapshot_path, path,
+        ):
+            audited_reader_extension = True
+            continue
+        raise RuntimeError(f"{role} 不是可证明的 CRLF/LF 等价源码")
+    return (
+        AUDITED_READER_MATCH_MODE
+        if audited_reader_extension
+        else "lf_normalized_equivalent_via_snapshot"
+    )
 
 
-# ---------- 冻结库存：只从 session0-only bundle 派生，不读取联合索引或测试 session ----------
-def build_online_inventory(context: BundleContext) -> OnlineInventory:
+def _legacy_events_from_task_rows(context: BundleContext, subject: int) -> list[MIEvent]:
+    """只为复核既有结果保留；新运行不得把训练窗口当作事件真值表。"""
+    task_rows = context.rows[context.rows["is_task"]]
+    event_keys = sorted({
+        (int(row["run"]), int(row["segment"]), int(row["trial"]))
+        for row in task_rows
+    })
+    events: list[MIEvent] = []
+    for run, segment, trial in event_keys:
+        rows = task_rows[
+            (task_rows["run"] == run)
+            & (task_rows["segment"] == segment)
+            & (task_rows["trial"] == trial)
+        ]
+        rows = np.sort(rows, order="start")
+        starts = rows["start"].astype(np.int64).tolist()
+        labels = set(int(value) for value in rows["stage2_label"])
+        if (
+            len(rows) != 5
+            or starts != list(range(starts[0], starts[0] + 625, 125))
+            or np.any(rows["stop"] - rows["start"] != 500)
+            or len(labels) != 1
+            or np.any(rows["final_label"] != rows["stage2_label"] + 1)
+        ):
+            raise RuntimeError("legacy session0 task 行不能唯一恢复冻结 MI 事件")
+        events.append(MIEvent(
+            f"s0_r{run}_t{trial}", subject, 0, run, segment,
+            int(rows["start"].min()), int(rows["stop"].max()), labels.pop() + 1,
+        ))
+    return events
+
+
+# ---------- 推理库存：此阶段只构建匿名连续窗口，进程尚未读取事件真值 ----------
+def _build_online_signal_inventory(context: BundleContext) -> OnlineSignalInventory:
     manifest = context.manifest
     subject = manifest.get("subject")
     if (
@@ -296,35 +453,6 @@ def build_online_inventory(context: BundleContext) -> OnlineInventory:
             for index, start in enumerate(starts)
         )
 
-    # 训练 bundle 的 task 行由每个干净 trial 的 5 个任务窗构成；其并集恰好恢复 4 秒 MI 区间。
-    task_rows = context.rows[context.rows["is_task"]]
-    event_keys = sorted({
-        (int(row["run"]), int(row["segment"]), int(row["trial"]))
-        for row in task_rows
-    })
-    events: list[MIEvent] = []
-    for run, segment, trial in event_keys:
-        rows = task_rows[
-            (task_rows["run"] == run)
-            & (task_rows["segment"] == segment)
-            & (task_rows["trial"] == trial)
-        ]
-        rows = np.sort(rows, order="start")
-        starts = rows["start"].astype(np.int64).tolist()
-        labels = set(int(value) for value in rows["stage2_label"])
-        if (
-            len(rows) != 5
-            or starts != list(range(starts[0], starts[0] + 625, 125))
-            or np.any(rows["stop"] - rows["start"] != 500)
-            or len(labels) != 1
-            or np.any(rows["final_label"] != rows["stage2_label"] + 1)
-        ):
-            raise RuntimeError("session0 task 行不能唯一恢复冻结 MI 事件")
-        events.append(MIEvent(
-            f"s0_r{run}_t{trial}", subject, 0, run, segment,
-            int(rows["start"].min()), int(rows["stop"].max()), labels.pop() + 1,
-        ))
-
     # BundleSignalStore 只读取身份和原生坐标，其余标签字段保持哨兵值，防止真值参与推理。
     signal_rows = np.zeros(len(windows), dtype=context.rows.dtype)
     signal_rows["trial"] = -1
@@ -337,13 +465,49 @@ def build_online_inventory(context: BundleContext) -> OnlineInventory:
         signal_rows[index]["window"] = window.window_index
         signal_rows[index]["start"] = window.window_start_sample
         signal_rows[index]["stop"] = window.window_stop_sample
-    return OnlineInventory(
+    return OnlineSignalInventory(
         segments,
-        events,
         windows,
         signal_rows,
         len(empty_records),
         sum(record["stop_native"] - record["start_native"] for record in empty_records),
+    )
+
+
+# ---------- 评分库存：决策轨迹完成后才把独立事件表与匿名推理库存合并 ----------
+def build_online_inventory(
+    context: BundleContext,
+    truth: TruthInventory | None = None,
+    *,
+    allow_legacy_event_reconstruction: bool = False,
+) -> OnlineInventory:
+    signal = _build_online_signal_inventory(context)
+    subject = context.manifest["subject"]
+    if truth is not None:
+        if truth.manifest.get("subject") != subject:
+            raise RuntimeError("独立真值与在线 bundle 被试不一致")
+        events = list(truth.events)
+        event_source = EXPLICIT_EVENT_SOURCE
+        truth_protocol_id = truth.manifest["protocol_id"]
+        truth_manifest_sha256 = truth.manifest_sha256
+        truth_event_file_sha256 = truth.event_file_sha256
+    elif allow_legacy_event_reconstruction:
+        events = _legacy_events_from_task_rows(context, subject)
+        event_source = LEGACY_EVENT_SOURCE
+        truth_protocol_id = None
+        truth_manifest_sha256 = None
+        truth_event_file_sha256 = None
+    else:
+        raise RuntimeError(
+            "新在线运行必须提供独立 session0 真值库存；"
+            "历史复核需显式 allow_legacy_event_reconstruction=True",
+        )
+    return OnlineInventory(
+        signal.segments, events, signal.windows, signal.signal_rows,
+        signal.fully_warmup_excluded_segment_count,
+        signal.fully_warmup_excluded_samples,
+        event_source, truth_protocol_id,
+        truth_manifest_sha256, truth_event_file_sha256,
     )
 
 
@@ -355,7 +519,9 @@ def verify_inventory_contract(
     """用全 NO_COMMAND 轨迹计算可信库存哈希；缺事件或缺窗口会在正式推理前失败。"""
     subject = context.manifest["subject"]
     artifact_identity = artifact_contract(context.manifest)
-    expected_protocol_id = inventory_contract_protocol_id(context.manifest)
+    expected_protocol_id = inventory_contract_protocol_id(
+        context.manifest, inventory.event_source,
+    )
     if (
         contract.get("protocol_id") != expected_protocol_id
         or contract.get("subject") != subject
@@ -371,6 +537,18 @@ def verify_inventory_contract(
         or contract.get("source_bundle", {}).get("index_sha256") != context.manifest["index_sha256"]
     ):
         raise RuntimeError("在线库存合同与 session0-only bundle 不匹配")
+    if inventory.event_source == EXPLICIT_EVENT_SOURCE:
+        truth_source = contract.get("source_truth", {})
+        if (
+            contract.get("event_source") != EXPLICIT_EVENT_SOURCE
+            or truth_source.get("protocol_id") != inventory.truth_protocol_id
+            or truth_source.get("manifest_sha256") != inventory.truth_manifest_sha256
+            or truth_source.get("event_file_sha256") != inventory.truth_event_file_sha256
+            or any(contract.get(key) != value for key, value in artifact_identity.items())
+        ):
+            raise RuntimeError("v3/v4 在线库存合同没有绑定独立真值或伪迹语义")
+    elif contract.get("event_source") not in (None, LEGACY_EVENT_SOURCE):
+        raise RuntimeError("legacy 在线库存合同声明了错误的事件来源")
     # v2 把伪迹和连续 segment 语义写入库存合同；v1 保持历史文件逐字兼容，
     # 但其 legacy binding 会在下游运行清单中被显式披露。
     if (
@@ -740,9 +918,9 @@ def save_seed_result(
     seed: int,
     stage1_logits: np.ndarray,
     stage2_logits: np.ndarray,
+    stateless: Sequence[DecisionRecord],
+    stateful: Sequence[DecisionRecord],
 ) -> tuple[dict[str, dict], dict]:
-    stateless = stateless_argmax_decisions(inventory.windows, stage1_logits, stage2_logits)
-    stateful = stateful_argmax_decisions(inventory.windows, stage1_logits, stage2_logits)
     metrics = {
         STATELESS_DIAGNOSTIC: evaluate_online_events(
             inventory.segments, inventory.events, inventory.windows, stateless,
@@ -805,12 +983,16 @@ def run(args: argparse.Namespace) -> dict:
     defaults = default_subject_paths(subject)
     bundle_manifest = Path(args.bundle_manifest or defaults.bundle_manifest).resolve()
     checkpoint_root = Path(args.checkpoint_root or defaults.checkpoint_root).resolve()
-    contract_path = Path(args.inventory_contract or defaults.inventory_contract).resolve()
-    output_root = Path(args.output_root or defaults.output_root).resolve()
-    if output_root.exists():
-        if not output_root.is_dir() or any(output_root.iterdir()):
-            raise FileExistsError(f"输出路径不是空目录，拒绝覆盖: {output_root}")
-    output_root.mkdir(parents=True, exist_ok=True)
+    legacy_events = bool(getattr(args, "legacy_event_reconstruction", False))
+    if legacy_events and getattr(args, "truth_manifest", None) is not None:
+        raise ValueError("legacy 事件恢复与 --truth-manifest 不能同时使用")
+    truth_manifest_path = None if legacy_events else Path(
+        args.truth_manifest or defaults.truth_manifest,
+    ).resolve()
+    default_contract = (
+        defaults.legacy_inventory_contract if legacy_events else defaults.inventory_contract
+    )
+    contract_path = Path(args.inventory_contract or default_contract).resolve()
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -827,10 +1009,19 @@ def run(args: argparse.Namespace) -> dict:
     if context.manifest.get("subject") != subject:
         raise RuntimeError("--subject 与 bundle manifest 的被试编号不一致")
     artifact_identity = artifact_contract(context.manifest)
-    output_protocol_version = bundle_contract_version(context.manifest)
-    inventory = build_online_inventory(context)
-    contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    no_command_control = verify_inventory_contract(context, inventory, contract)
+    signal_inventory = _build_online_signal_inventory(context)
+
+    # 默认目录后缀由 bundle 版本和事件来源共同决定，避免 v1/v2/v4 落入 _v3。
+    output_event_source = (
+        LEGACY_EVENT_SOURCE if legacy_events else EXPLICIT_EVENT_SOURCE
+    )
+    output_root = Path(args.output_root).resolve() if args.output_root else (
+        default_output_root_for_protocol(subject, context.manifest, output_event_source).resolve()
+    )
+    if output_root.exists():
+        if not output_root.is_dir() or any(output_root.iterdir()):
+            raise FileExistsError(f"输出路径不是空目录，拒绝覆盖: {output_root}")
+    output_root.mkdir(parents=True, exist_ok=True)
 
     seeds = tuple(sorted(set(int(seed) for seed in args.seeds)))
     if not seeds or any(seed not in KNOWN_SEEDS for seed in seeds):
@@ -838,17 +1029,19 @@ def run(args: argparse.Namespace) -> dict:
     full_seed_grid = seeds == KNOWN_SEEDS
     scores = {
         seed: {
-            1: np.full((len(inventory.windows), 2), np.nan, dtype=np.float32),
-            2: np.full((len(inventory.windows), 4), np.nan, dtype=np.float32),
+            1: np.full((len(signal_inventory.windows), 2), np.nan, dtype=np.float32),
+            2: np.full((len(signal_inventory.windows), 4), np.nan, dtype=np.float32),
         }
         for seed in seeds
     }
     checkpoint_records: list[dict] = []
-    run_ids = np.asarray([window.run_id for window in inventory.windows], dtype=np.int64)
+    run_ids = np.asarray(
+        [window.run_id for window in signal_inventory.windows], dtype=np.int64,
+    )
 
     for fold in FIXED_FOLDS:
         online_indices = np.flatnonzero(run_ids == fold)
-        online_rows = inventory.signal_rows[online_indices]
+        online_rows = signal_inventory.signal_rows[online_indices]
         online_features = materialize_rows(context, online_rows, fold)
         for seed in seeds:
             for stage in (1, 2):
@@ -880,13 +1073,46 @@ def run(args: argparse.Namespace) -> dict:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-    seed_results: dict[int, dict[str, dict]] = {}
-    seed_artifacts: dict[str, dict] = {}
+    # 所有模型分数和两种决策轨迹先完整产生；这一段尚未打开真值文件或合同。
+    seed_decisions: dict[int, tuple[list[DecisionRecord], list[DecisionRecord]]] = {}
     for seed in seeds:
         if not np.isfinite(scores[seed][1]).all() or not np.isfinite(scores[seed][2]).all():
             raise RuntimeError(f"seed {seed} 没有覆盖完整连续窗口母索引")
+        seed_decisions[seed] = (
+            stateless_argmax_decisions(
+                signal_inventory.windows, scores[seed][1], scores[seed][2],
+            ),
+            stateful_argmax_decisions(
+                signal_inventory.windows, scores[seed][1], scores[seed][2],
+            ),
+        )
+
+    # 只有决策轨迹冻结后才加载真值并做事件匹配；真值不可能影响前面的模型或策略。
+    truth = (
+        None if truth_manifest_path is None
+        else load_truth_inventory(truth_manifest_path, context)
+    )
+    inventory = build_online_inventory(
+        context, truth,
+        allow_legacy_event_reconstruction=legacy_events,
+    )
+    if (
+        inventory.segments != signal_inventory.segments
+        or inventory.windows != signal_inventory.windows
+        or not np.array_equal(inventory.signal_rows, signal_inventory.signal_rows)
+    ):
+        raise RuntimeError("加载真值后匿名推理库存发生变化")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    no_command_control = verify_inventory_contract(context, inventory, contract)
+    output_protocol_version = contract["protocol_id"].rsplit("_", 1)[-1]
+
+    seed_results: dict[int, dict[str, dict]] = {}
+    seed_artifacts: dict[str, dict] = {}
+    for seed in seeds:
+        stateless, stateful = seed_decisions[seed]
         metrics, artifacts = save_seed_result(
             output_root, inventory, contract, seed, scores[seed][1], scores[seed][2],
+            stateless, stateful,
         )
         seed_results[seed] = metrics
         seed_artifacts[str(seed)] = artifacts
@@ -928,6 +1154,12 @@ def run(args: argparse.Namespace) -> dict:
         "seeds": list(seeds),
         "bundle_manifest": display_path(bundle_manifest),
         "bundle_manifest_sha256": context.manifest_sha256,
+        "event_source": inventory.event_source,
+        "truth_load_phase": TRUTH_LOAD_PHASE,
+        "truth_manifest": (
+            None if truth_manifest_path is None else display_path(truth_manifest_path)
+        ),
+        "truth_manifest_sha256": inventory.truth_manifest_sha256,
         "checkpoint_root": display_path(checkpoint_root),
         "inventory_contract": display_path(contract_path),
         "inventory_contract_sha256": file_hash(contract_path),
@@ -962,9 +1194,15 @@ def run(args: argparse.Namespace) -> dict:
             "aggregation": "none",
             "confidence_threshold": "none",
         },
+        "truth_load_phase": TRUTH_LOAD_PHASE,
         "inputs": {
             "bundle_manifest": display_path(bundle_manifest),
             "bundle_manifest_sha256": context.manifest_sha256,
+            "event_source": inventory.event_source,
+            "truth_manifest": (
+                None if truth_manifest_path is None else display_path(truth_manifest_path)
+            ),
+            "truth_manifest_sha256": inventory.truth_manifest_sha256,
             "checkpoint_root": display_path(checkpoint_root),
             "inventory_contract": display_path(contract_path),
             "inventory_contract_sha256": file_hash(contract_path),
@@ -978,6 +1216,7 @@ def run(args: argparse.Namespace) -> dict:
         "summary": summary,
         "source_sha256": {
             "runner": file_hash(Path(__file__)),
+            "online_truth_inventory": file_hash(EVAL_DIR / "online_truth_inventory.py"),
             "protocol_metrics": file_hash(EVAL_DIR / "protocol_metrics.py"),
             "oof_training_bundle_reader": file_hash(TRAIN_DIR / "oof_training_bundle.py"),
             "model_factory": file_hash(MODELS_DIR / "model_factory.py"),
@@ -997,10 +1236,15 @@ def parse_args() -> argparse.Namespace:
     # 路径参数为空时由 subject 推导；显式覆盖主要用于预检和迁移验证。
     parser.add_argument("--bundle-manifest", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
+    parser.add_argument("--truth-manifest", type=Path)
     parser.add_argument("--inventory-contract", type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(KNOWN_SEEDS))
+    parser.add_argument(
+        "--legacy-event-reconstruction", action="store_true",
+        help="仅用于复核历史结果：从5个离线Task窗口恢复事件",
+    )
     parser.add_argument("--quiet", dest="verbose", action="store_false", default=True)
     return parser.parse_args()
 

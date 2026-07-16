@@ -185,7 +185,10 @@ def run(args: argparse.Namespace) -> dict:
     defaults = default_subject_paths(subject)
     bundle_manifest = Path(args.bundle_manifest or defaults.bundle_manifest).resolve()
     checkpoint_root = Path(args.checkpoint_root or defaults.checkpoint_root).resolve()
-    inventory_contract = Path(args.inventory_contract or defaults.inventory_contract).resolve()
+    # 该预检绑定既有 v1 分数产物，只允许显式走历史事件恢复合同。
+    inventory_contract = Path(
+        args.inventory_contract or defaults.legacy_inventory_contract,
+    ).resolve()
     frozen_scores = Path(
         args.frozen_scores
         or FROZEN_SCORE_ROOT / f"subject_{subject:02d}" / f"seed{seed}_scores_and_decisions.npz"
@@ -211,7 +214,9 @@ def run(args: argparse.Namespace) -> dict:
     context = load_bundle(bundle_manifest, verify_hashes=True)
     if context.manifest.get("subject") != subject:
         raise RuntimeError("--subject 与 session0-only bundle 不一致")
-    inventory = build_online_inventory(context)
+    inventory = build_online_inventory(
+        context, allow_legacy_event_reconstruction=True,
+    )
     contract = json.loads(inventory_contract.read_text(encoding="utf-8"))
     verify_inventory_contract(context, inventory, contract)
     expected_rows = output_window_rows(inventory.windows)

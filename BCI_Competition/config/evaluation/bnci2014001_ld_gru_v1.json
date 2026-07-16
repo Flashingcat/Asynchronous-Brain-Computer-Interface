@@ -1,0 +1,113 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_ld_gru_nested_loso_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "subjects": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "base_seeds": [42, 43, 44],
+  "decision_seed_offset": 1000,
+  "ablations": ["stop_only", "stop_residual"],
+  "frozen_eeg_models": {
+    "checkpoint_epoch": 50,
+    "input_domain": "causal_native250",
+    "stage1_and_stage2_retraining": false,
+    "score_source": "session0 run-level OOF continuous logits"
+  },
+  "candidate_state": {
+    "stage1_filter": "alpha0.5 EWMA over task-minus-idle margin",
+    "stage1_alpha": 0.5,
+    "task_on_probability": 0.5,
+    "task_hold_probability": 0.3,
+    "drop_abort_delta": 0.2,
+    "idle_reset_probability": 0.2,
+    "idle_reset_consecutive_windows": 1,
+    "max_after_open_windows": 8,
+    "opening_window_enters_gru": true,
+    "opening_window_can_commit": false,
+    "candidate_priority": ["stage1_abort", "learned_gru_commit", "candidate_timeout"]
+  },
+  "token": {
+    "dimension": 12,
+    "fields": [
+      "stage1_raw_task_idle_margin",
+      "stage1_ewma_task_probability",
+      "stage1_ewma_task_probability_delta",
+      "stage2_centered_logit_class1",
+      "stage2_centered_logit_class2",
+      "stage2_centered_logit_class3",
+      "stage2_centered_logit_class4",
+      "stage2_centered_logit_delta_class1",
+      "stage2_centered_logit_delta_class2",
+      "stage2_centered_logit_delta_class3",
+      "stage2_centered_logit_delta_class4",
+      "candidate_age_divided_by_8"
+    ],
+    "standardized_fields": "first_11_only",
+    "normalizer_source": "current decision-model training subjects only",
+    "constant_std_rule": "population std below 1e-6 becomes 1.0",
+    "stage2_delta_history": "previous formal window within the same segment"
+  },
+  "model": {
+    "input_dimension": 12,
+    "hidden_dimension": 8,
+    "gru_layers": 1,
+    "total_parameter_count": 573,
+    "stop_head_initial_bias": -3.0,
+    "class_head": "zero-initialized residual correction over current centered Stage2 logits"
+  },
+  "loss": {
+    "kind": "set_valued_first_commit_hazard",
+    "positive": "negative log total probability of any evaluator-correct time-class point",
+    "negative": "negative log probability of no submission in the candidate",
+    "balance": "0.5 mean positive plus 0.5 mean negative",
+    "opening_stop_probability": 0.0,
+    "single_token_candidate": "kept in inventory but excluded from gradient batches because loss is identically zero"
+  },
+  "training": {
+    "optimizer": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "batch_size": 64,
+    "max_epochs": 200,
+    "gradient_clip_norm": 1.0,
+    "early_stopping_patience": 20,
+    "early_stopping_min_delta": 1e-8,
+    "balanced_batching": "equal positive and negative candidates with deterministic cycling",
+    "deterministic_epoch_seed": "decision_seed_times_1000_plus_epoch"
+  },
+  "nested_loso": {
+    "outer": "leave one subject out for final evaluation",
+    "inner": "among the remaining eight, train seven and validate one",
+    "shared_pair_optimization": "one seven-subject trajectory per unordered held pair; each endpoint permanently freezes its checkpoint when its own patience is first reached",
+    "inner_unique_training_trajectories_per_seed_ablation": 36,
+    "inner_ordered_validation_folds_per_seed_ablation": 72,
+    "final_epoch_rule": "median of eight inner best epochs rounded half up",
+    "outer_subject_use_before_final_evaluation": "forbidden"
+  },
+  "threshold_selection": {
+    "grid": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
+    "far_anchor": "dual_ewma_drop_abort c055_r020_l1",
+    "feasibility": "equal-subject mean validation FAR must not exceed anchor mean FAR",
+    "ranking": [
+      "maximize equal-subject mean correct_event_rate",
+      "minimize equal-subject mean FAR",
+      "minimize equal-subject mean correct_latency_p90_seconds",
+      "choose higher stop threshold"
+    ]
+  },
+  "reported_references": [
+    "single_window_stateful",
+    "n5_k3_hard_vote",
+    "dual_ewma_drop_abort_c055_r020_l1",
+    "ld_gru_v1"
+  ],
+  "event_matching": {
+    "sampling_rate": 250,
+    "window_samples": 500,
+    "step_samples": 125,
+    "minimum_overlap_samples": 125,
+    "window_stop_must_not_exceed_event_offset": true
+  },
+  "aggregation": "equal-subject macro within paired seed, then mean and population standard deviation over seeds",
+  "claim_limit": "session0 OOF nested-subject evaluation of a learned decision layer; not session1 performance or a deployed online artifact solution"
+}

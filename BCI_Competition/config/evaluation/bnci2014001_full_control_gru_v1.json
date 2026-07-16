@@ -1,0 +1,116 @@
+{
+  "protocol_id": "bnci2014001_s01_s09_epoch50_causal_full_control_gru_nested_loso_v1",
+  "input_protocol_id": "bnci2014001_s01_s09_epoch50_causal_single_window_oof_v1",
+  "included_session": 0,
+  "test_session_access": "forbidden",
+  "subjects": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "base_seeds": [42, 43, 44],
+  "decision_seed_offset": 2000,
+  "frozen_eeg_models": {
+    "checkpoint_epoch": 50,
+    "input_domain": "causal_native250",
+    "stage1_and_stage2_retraining": false,
+    "score_source": "session0 run-level OOF continuous logits"
+  },
+  "continuous_token": {
+    "dimension": 10,
+    "fields": [
+      "stage1_raw_task_idle_margin",
+      "stage1_raw_task_idle_margin_delta",
+      "stage2_centered_logit_class1",
+      "stage2_centered_logit_class2",
+      "stage2_centered_logit_class3",
+      "stage2_centered_logit_class4",
+      "stage2_centered_logit_delta_class1",
+      "stage2_centered_logit_delta_class2",
+      "stage2_centered_logit_delta_class3",
+      "stage2_centered_logit_delta_class4"
+    ],
+    "normalizer_source": "current decision-model training subjects only",
+    "constant_std_rule": "population std below 1e-6 becomes 1.0",
+    "delta_history": "previous formal window within the same clean segment",
+    "segment_start_delta": 0.0,
+    "candidate_age_or_state_input": false
+  },
+  "supervision": {
+    "classes": ["IDLE", "left_hand", "right_hand", "feet", "tongue"],
+    "idle_target": "window has zero sample overlap with every retained MI event",
+    "mi_target": "window is an evaluator-eligible first-commit point and uses that event class",
+    "ignored_target": "window overlaps an MI event but is not evaluator-eligible",
+    "outer_subject_target_flow": "truth inventory may be opened centrally, but outer subject sequences and labels are excluded from every training and threshold-selection object and are used only by the final evaluator"
+  },
+  "model": {
+    "input_dimension": 10,
+    "hidden_dimension": 16,
+    "gru_layers": 1,
+    "total_parameter_count": 1429,
+    "outputs": "one TASK logit plus four conditional MI-class logits",
+    "joint_probabilities": "P(IDLE)=1-sigmoid(task); P(MI_class)=sigmoid(task)*softmax(class)[class]",
+    "hidden_reset": "only at clean segment boundary",
+    "hidden_persists_across_ready_wait_idle": true
+  },
+  "loss": {
+    "kind": "balanced_state_plus_conditional_class_cross_entropy",
+    "state_component": "equal mean of IDLE and TASK binary NLL",
+    "class_component": "equal mean of the four per-class conditional NLL values",
+    "balance": "0.5 state component plus 0.5 class component",
+    "ignored_boundary_windows": "no loss"
+  },
+  "training": {
+    "optimizer": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "batch_size": 512,
+    "batch_semantics": "all padded clean segments in the split form one gradient step and must fit below batch_size",
+    "max_epochs": 200,
+    "gradient_clip_norm": 1.0,
+    "early_stopping_patience": 20,
+    "early_stopping_min_delta": 1e-8,
+    "determinism": "decision seed fixes initialization and deterministic CUDA algorithms"
+  },
+  "nested_loso": {
+    "outer": "leave one subject out for final evaluation",
+    "inner": "among the remaining eight, train seven and validate one",
+    "shared_pair_optimization": "one seven-subject trajectory per unordered held pair; each endpoint permanently freezes its checkpoint when its own patience is first reached",
+    "inner_unique_training_trajectories_per_seed": 36,
+    "inner_ordered_validation_folds_per_seed": 72,
+    "final_epoch_rule": "median of eight inner best epochs rounded half up",
+    "outer_subject_use_before_final_evaluation": "forbidden"
+  },
+  "decision_shell": {
+    "states": ["READY", "WAIT_IDLE"],
+    "ready_submit": "emit argmax conditional MI class when GRU P(TASK) reaches selected commit threshold",
+    "wait_idle_reset": "return to READY when GRU P(IDLE) reaches selected reset threshold",
+    "duplicate_prevention": "WAIT_IDLE never emits an MI command",
+    "handwritten_stage1_open_hold_drop_reset": false,
+    "same_window_reset_and_resubmit": false
+  },
+  "threshold_selection": {
+    "commit_grid": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    "reset_grid": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    "far_anchor": "dual_ewma_drop_abort c055_r020_l1",
+    "feasibility": "equal-subject mean validation FAR must not exceed anchor mean FAR",
+    "ranking": [
+      "maximize equal-subject mean correct_event_rate",
+      "minimize equal-subject mean FAR",
+      "minimize equal-subject mean correct_latency_p90_seconds",
+      "choose higher commit threshold",
+      "choose higher reset threshold"
+    ]
+  },
+  "reported_references": [
+    "single_window_stateful",
+    "n5_k3_hard_vote",
+    "dual_ewma_drop_abort_c055_r020_l1",
+    "full_control_gru_v1"
+  ],
+  "event_matching": {
+    "sampling_rate": 250,
+    "window_samples": 500,
+    "step_samples": 125,
+    "minimum_overlap_samples": 125,
+    "window_stop_must_not_exceed_event_offset": true
+  },
+  "aggregation": "equal-subject macro within paired seed, then mean and population standard deviation over seeds",
+  "claim_limit": "session0 OOF nested-subject evaluation of a continuous learned decision layer; GRU owns task evidence, MI class and idle reset evidence, while READY/WAIT_IDLE is retained only as a duplicate-command safety shell; not session1 performance or deployed artifact handling"
+}

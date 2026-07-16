@@ -16,6 +16,7 @@ NATIVE_SAMPLING_RATE = 250.0
 WINDOW_SAMPLES = 500
 STEP_SAMPLES = 125
 MIN_OVERLAP_SECONDS = 0.5
+DEFAULT_EVENT_MARGIN_SAMPLES = int(NATIVE_SAMPLING_RATE * MIN_OVERLAP_SECONDS)
 READY = "READY"
 TASK_CANDIDATE = "TASK_CANDIDATE"
 WAIT_IDLE = "WAIT_IDLE"
@@ -26,6 +27,7 @@ CANDIDATE_OPEN = "candidate_open"
 CANDIDATE_ABORT_STAGE1 = "candidate_abort_stage1"
 CANDIDATE_TIMEOUT = "candidate_timeout"
 COMMAND_COMMIT = "command_commit"
+LEARNED_GRU_COMMIT = "learned_gru_commit"
 FAST0_COMMAND_COMMIT = "fast0_command_commit"
 FAST1_COMMAND_COMMIT = "fast1_command_commit"
 IDLE_RESET = "idle_reset"
@@ -396,6 +398,65 @@ def _eligible(record: DecisionRecord | ExpectedWindow, event: MIEvent, margin_sa
     )
 
 
+@dataclass(frozen=True)
+class CounterfactualCommitResult:
+    """描述“此前未提交、当前首次提交”在正式匹配规则下的结果。"""
+
+    outcome: str
+    event_id: str | None
+    true_class: int | None
+
+
+def classify_counterfactual_first_commit(
+    window: DecisionRecord | ExpectedWindow,
+    emitted_class: int,
+    events: Sequence[MIEvent],
+    *,
+    margin_samples: int = DEFAULT_EVENT_MARGIN_SAMPLES,
+    used_event_ids: frozenset[str] = frozenset(),
+) -> CounterfactualCommitResult:
+    """复用正式评估器的窗口资格规则，给单次反事实提交确定唯一类别。
+
+    训练 LD-GRU 时只把 ``correct`` 置入集合式监督掩码。可选的
+    ``used_event_ids`` 让诊断代码也能显式表示一个已匹配事件内的额外输出。
+    """
+    if not isinstance(window, (DecisionRecord, ExpectedWindow)):
+        raise TypeError("window 必须是 DecisionRecord 或 ExpectedWindow")
+    if type(emitted_class) is not int or emitted_class not in range(1, MI_CLASS_COUNT + 1):
+        raise ValueError("emitted_class 必须是整数 1..4")
+    if type(margin_samples) is not int or margin_samples < 1:
+        raise ValueError("margin_samples 必须为正整数")
+    if not isinstance(used_event_ids, frozenset) or any(
+        not isinstance(value, str) for value in used_event_ids
+    ):
+        raise TypeError("used_event_ids 必须是字符串 frozenset")
+
+    stream_events = [event for event in events if event.key == window.key]
+    eligible = [event for event in stream_events if _eligible(window, event, margin_samples)]
+    if len(eligible) > 1:
+        raise ValueError("同一窗口不得同时成为多个事件的合法首次提交点")
+    if eligible:
+        event = eligible[0]
+        if event.event_id in used_event_ids:
+            outcome = "additional_event"
+        else:
+            outcome = "correct" if emitted_class == event.true_class else "wrong_class"
+        return CounterfactualCommitResult(outcome, event.event_id, event.true_class)
+
+    covering = [
+        event for event in stream_events
+        if event.onset_sample <= window.window_stop_sample <= event.offset_sample
+    ]
+    if not covering:
+        return CounterfactualCommitResult("idle_false", None, None)
+    event = max(covering, key=lambda item: _overlap_samples(window, item))
+    return CounterfactualCommitResult(
+        "too_early" if _overlap_samples(window, event) < margin_samples else "additional_event",
+        event.event_id,
+        event.true_class,
+    )
+
+
 def _inventory_sha256(rows: list[dict]) -> str:
     payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -560,6 +621,7 @@ def _validate_online_inputs(
                         (READY, WAIT_IDLE): {FAST0_COMMAND_COMMIT},
                         (TASK_CANDIDATE, WAIT_IDLE): {
                             COMMAND_COMMIT,
+                            LEARNED_GRU_COMMIT,
                             FAST1_COMMAND_COMMIT,
                         },
                     }
@@ -628,6 +690,7 @@ def _candidate_diagnostics(
                 CANDIDATE_ABORT_STAGE1,
                 CANDIDATE_TIMEOUT,
                 COMMAND_COMMIT,
+                LEARNED_GRU_COMMIT,
                 FAST1_COMMAND_COMMIT,
             }:
                 continue
@@ -669,6 +732,7 @@ def _candidate_diagnostics(
             CANDIDATE_ABORT_STAGE1,
             CANDIDATE_TIMEOUT,
             COMMAND_COMMIT,
+            LEARNED_GRU_COMMIT,
             FAST1_COMMAND_COMMIT,
             "segment_end_unresolved",
         )
@@ -715,10 +779,14 @@ def _candidate_diagnostics(
             None if valid_seconds <= 0 else open_count / (valid_seconds / 60.0)
         ),
         "candidate_command_count": (
-            outcome_counts[COMMAND_COMMIT] + outcome_counts[FAST1_COMMAND_COMMIT]
+            outcome_counts[COMMAND_COMMIT]
+            + outcome_counts[LEARNED_GRU_COMMIT]
+            + outcome_counts[FAST1_COMMAND_COMMIT]
         ),
         "candidate_conversion_rate": ratio(
-            outcome_counts[COMMAND_COMMIT] + outcome_counts[FAST1_COMMAND_COMMIT]
+            outcome_counts[COMMAND_COMMIT]
+            + outcome_counts[LEARNED_GRU_COMMIT]
+            + outcome_counts[FAST1_COMMAND_COMMIT]
         ),
         "candidate_abort_count": abort_count,
         "candidate_abort_rate": ratio(abort_count),
@@ -800,6 +868,7 @@ def evaluate_online_events(
 
     matches: list[dict] = []
     used_records: set[DecisionRecord] = set()
+    used_event_ids_by_stream: dict[tuple[int, int, int, int], set[str]] = {}
     for event in sorted(events, key=lambda item: (*item.key, item.onset_sample)):
         eligible_expected = [
             window for window in expected_by_stream.get(event.key, [])
@@ -810,9 +879,16 @@ def evaluate_online_events(
         matched = emitted[0] if emitted else None
         if matched is not None:
             used_records.add(matched)
+            used_event_ids_by_stream.setdefault(event.key, set()).add(event.event_id)
         outcome = "unscorable" if not eligible else "miss"
         if matched is not None:
-            outcome = "correct" if matched.emitted_class == event.true_class else "wrong_class"
+            # 单次提交的类别判定与 LD-GRU 训练掩码共用同一公共函数。
+            classified = classify_counterfactual_first_commit(
+                matched, matched.emitted_class, [event], margin_samples=margin_samples,
+            )
+            if classified.outcome not in {"correct", "wrong_class"}:
+                raise RuntimeError("正式匹配记录未被公共函数判为合法事件提交")
+            outcome = classified.outcome
         matches.append({
             "event_id": event.event_id,
             "subject_id": event.subject_id,
@@ -833,18 +909,21 @@ def evaluate_online_events(
     too_early_commands = 0
     additional_event_commands = 0
     for record in (item for item in ordered_decisions if item.emitted_class != NO_COMMAND and item not in used_records):
-        candidates = [
-            event for event in events_by_stream.get(record.key, [])
-            if event.onset_sample <= record.window_stop_sample <= event.offset_sample
-        ]
-        if not candidates:
+        classified = classify_counterfactual_first_commit(
+            record,
+            record.emitted_class,
+            events_by_stream.get(record.key, []),
+            margin_samples=margin_samples,
+            used_event_ids=frozenset(used_event_ids_by_stream.get(record.key, set())),
+        )
+        if classified.outcome == "idle_false":
             idle_false_commands += 1
-            continue
-        event = max(candidates, key=lambda item: _overlap_samples(record, item))
-        if _overlap_samples(record, event) < margin_samples:
+        elif classified.outcome == "too_early":
             too_early_commands += 1
-        else:
+        elif classified.outcome == "additional_event":
             additional_event_commands += 1
+        else:
+            raise RuntimeError("未匹配命令被公共函数判为新的合法首次提交")
 
     scorable = [item for item in matches if item["scorable"]]
     correct = [item for item in scorable if item["outcome"] == "correct"]

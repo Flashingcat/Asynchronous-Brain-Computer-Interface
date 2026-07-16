@@ -15,6 +15,7 @@ EVAL_DIR = Path(__file__).resolve().parents[1] / "code" / "eval"
 sys.path.insert(0, str(EVAL_DIR))
 
 from protocol_metrics import (  # noqa: E402
+    MIEvent,
     READY,
     STATEFUL_STRICT,
     STATELESS_DIAGNOSTIC,
@@ -24,9 +25,15 @@ from protocol_metrics import (  # noqa: E402
     ScoringSegment,
     evaluate_online_events,
 )
+from online_truth_inventory import (  # noqa: E402
+    EXPLICIT_EVENT_SOURCE,
+    TruthInventory,
+)
 from run_epoch50_online_oof import (  # noqa: E402
+    LEGACY_EVENT_SOURCE,
     build_online_inventory,
     bundle_contract_version,
+    default_output_root_for_protocol,
     default_subject_paths,
     inventory_contract_protocol_id,
     output_window_rows,
@@ -69,11 +76,26 @@ def fake_context(subject: int = 1) -> SimpleNamespace:
     return SimpleNamespace(manifest=manifest, manifest_sha256="a" * 64, rows=rows)
 
 
+def fake_truth(subject: int = 1, trial: int = 7) -> TruthInventory:
+    event = MIEvent(f"s0_r0_t{trial}", subject, 0, 0, 0, 500, 1500, 3)
+    return TruthInventory(
+        {
+            "protocol_id": f"bnci2014001_s{subject:02d}_session0_clean_event_truth_native250_v1",
+            "subject": subject,
+            "event_source": EXPLICIT_EVENT_SOURCE,
+        },
+        Path("truth/manifest.json"), "c" * 64, "d" * 64, (event,),
+    )
+
+
 class InventoryTests(unittest.TestCase):
     def test_bundle_contract_version_separates_legacy_and_explicit_manifests(self) -> None:
         explicit = fake_context().manifest
         self.assertEqual(bundle_contract_version(explicit), "v2")
         self.assertTrue(inventory_contract_protocol_id(explicit).endswith("_v2"))
+        self.assertTrue(
+            inventory_contract_protocol_id(explicit, EXPLICIT_EVENT_SOURCE).endswith("_v4"),
+        )
 
         legacy = copy.deepcopy(explicit)
         legacy["protocol_id"] = "bnci2014001_s01_oof_train_session0_native250_v1"
@@ -81,9 +103,27 @@ class InventoryTests(unittest.TestCase):
         legacy.pop("segment_policy")
         self.assertEqual(bundle_contract_version(legacy), "v1")
         self.assertTrue(inventory_contract_protocol_id(legacy).endswith("_v1"))
+        self.assertTrue(
+            inventory_contract_protocol_id(legacy, EXPLICIT_EVENT_SOURCE).endswith("_v3"),
+        )
+
+        # 四种 bundle×event 组合的默认目录必须与合同后缀逐一对齐。
+        cases = (
+            (legacy, LEGACY_EVENT_SOURCE, "_v1"),
+            (explicit, LEGACY_EVENT_SOURCE, "_v2"),
+            (legacy, EXPLICIT_EVENT_SOURCE, "_v3"),
+            (explicit, EXPLICIT_EVENT_SOURCE, "_v4"),
+        )
+        for manifest, event_source, suffix in cases:
+            with self.subTest(suffix=suffix):
+                self.assertTrue(
+                    default_output_root_for_protocol(1, manifest, event_source).name.endswith(suffix),
+                )
 
     def test_session0_bundle_deterministically_restores_inventory(self) -> None:
-        inventory = build_online_inventory(fake_context())
+        inventory = build_online_inventory(
+            fake_context(), allow_legacy_event_reconstruction=True,
+        )
 
         self.assertEqual(len(inventory.segments), 1)
         self.assertEqual(len(inventory.windows), 13)
@@ -97,7 +137,9 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue(np.all(inventory.signal_rows["stage2_label"] == -1))
 
     def test_subject9_uses_its_own_identity_and_paths(self) -> None:
-        inventory = build_online_inventory(fake_context(subject=9))
+        inventory = build_online_inventory(
+            fake_context(subject=9), fake_truth(subject=9),
+        )
         self.assertTrue(all(item.subject_id == 9 for item in inventory.segments))
         self.assertTrue(all(item.subject_id == 9 for item in inventory.events))
         self.assertTrue(all(item.subject_id == 9 for item in inventory.windows))
@@ -107,6 +149,30 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("s09_oof_train_session0", str(paths.bundle_manifest))
         self.assertIn("extension_s09", str(paths.checkpoint_root))
         self.assertIn("s09_session0_causal_online", str(paths.inventory_contract))
+        self.assertIn("clean_event_truth", str(paths.truth_manifest))
+
+    def test_new_inventory_rejects_missing_truth_by_default(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "必须提供独立"):
+            build_online_inventory(fake_context())
+
+    def test_event_with_zero_offline_task_rows_remains_scorable(self) -> None:
+        context = fake_context()
+        context.rows = context.rows[:0].copy()
+        inventory = build_online_inventory(context, fake_truth())
+        decisions = [
+            DecisionRecord(
+                *window.key, window.window_index,
+                window.window_start_sample, window.window_stop_sample,
+            )
+            for window in inventory.windows
+        ]
+        result = evaluate_online_events(
+            inventory.segments, inventory.events, inventory.windows, decisions,
+            mode=STATELESS_DIAGNOSTIC,
+        )
+        self.assertEqual(result["event_count"], 1)
+        self.assertEqual(result["scorable_event_count"], 1)
+        self.assertEqual(result["miss_rate"], 1.0)
 
     def test_fully_warmup_excluded_segment_is_counted_not_scored(self) -> None:
         context = fake_context()
@@ -123,7 +189,9 @@ class InventoryTests(unittest.TestCase):
                 "formal_start_native": 250, "formal_stop_native": 2000,
             },
         ]
-        inventory = build_online_inventory(context)
+        inventory = build_online_inventory(
+            context, allow_legacy_event_reconstruction=True,
+        )
         self.assertEqual(len(inventory.segments), 1)
         self.assertEqual(inventory.segments[0].segment_id, 1)
         self.assertEqual(inventory.fully_warmup_excluded_segment_count, 1)
@@ -132,7 +200,9 @@ class InventoryTests(unittest.TestCase):
 
     def test_frozen_contract_detects_inventory_change(self) -> None:
         context = fake_context()
-        inventory = build_online_inventory(context)
+        inventory = build_online_inventory(
+            context, allow_legacy_event_reconstruction=True,
+        )
         decisions = [
             DecisionRecord(
                 *window.key, window.window_index,

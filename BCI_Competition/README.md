@@ -80,7 +80,7 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 - BNCI2014001 原始 MAT 的 MI 为 trial 开始后 `2–6 s`；MOABB cue annotation 已位于该 MI 起点，不能再次加 2 秒；
 - 22 个 EEG 通道、250 Hz、2 秒窗口、0.5 秒步长；
 - 官方伪迹 trial 整段删除，删除两侧不得拼接，一个 run 保留为多个独立 segment；
-- 每名被试只在 session 0 内做六折留一完整 run 的 OOF 训练/验证；session 1 在工作点冻结前保持封存；
+- 每名被试只在 session 0 内做六折留一完整 run 的 OOF 训练/验证；session 1 不参与拟合和工作点选择。既有联合母索引曾解析 session 1，因此这里不声称历史 blind test；
 - 在线回放消费每个有效 segment 的全部连续窗口，包括 MI/IDLE 边界窗口。
 
 以下命令以已经下载好的 MAT 目录为输入，先构建 Subject 1 的完整正式数据链：
@@ -98,6 +98,7 @@ python BCI_Competition/code/preprocessing/build_causal_filter_store.py --subject
 python BCI_Competition/code/preprocessing/build_zero_phase_filter_store.py --subjects 1
 python BCI_Competition/code/preprocessing/build_fold_normalization.py --subjects 1
 python BCI_Competition/code/preprocessing/build_oof_training_bundle.py --subjects 1
+python BCI_Competition/code/eval/online_truth_inventory.py --subjects 1
 ```
 
 训练前先运行真实 GPU 全流程预检，再启动固定 50 epoch 的 OOF 矩阵：
@@ -105,8 +106,9 @@ python BCI_Competition/code/preprocessing/build_oof_training_bundle.py --subject
 ```powershell
 $bundle = 'BCI_Competition/data/processed/bnci2014001_s01_oof_train_session0_native250_v2/manifest.json'
 $checkpoints = 'BCI_Competition/results/checkpoints/eegnet_oof_native250_v2'
-$inventoryDir = 'BCI_Competition/results/tables/online_inventory_contracts_v2'
-$inventory = "$inventoryDir/bnci2014001_s01_session0_causal_online_v2.json"
+$truth = 'BCI_Competition/data/processed/bnci2014001_s01_session0_clean_event_truth_native250_v1/manifest.json'
+$inventoryDir = 'BCI_Competition/results/tables/online_inventory_contracts_v4'
+$inventory = "$inventoryDir/bnci2014001_s01_session0_causal_online_v4.json"
 
 python BCI_Competition/code/train/preflight_eegnet_oof.py `
   --training-bundle $bundle `
@@ -118,11 +120,11 @@ python BCI_Competition/code/eval/freeze_online_inventory_contracts.py `
   --output-dir $inventoryDir --write-missing
 python BCI_Competition/code/eval/run_epoch50_online_oof.py `
   --subject 1 --bundle-manifest $bundle --checkpoint-root $checkpoints `
-  --inventory-contract $inventory `
-  --output-root BCI_Competition/results/tables/s01_epoch50_causal_single_window_oof_v2
+  --truth-manifest $truth --inventory-contract $inventory `
+  --output-root BCI_Competition/results/tables/s01_epoch50_causal_single_window_oof_v4
 ```
 
-新建流程统一使用显式伪迹合同的 v2 身份；仓库 `config/evaluation/*_v1.json` 只绑定既有 v1 bundle 与历史 checkpoint，不能拿来验证新生成的 bundle。
+新建训练 bundle 使用显式伪迹合同的 v2 身份，与独立真值侧车组合后使用在线 v4 合同；既有 v1 bundle 与独立真值组合使用在线 v3。仓库 `config/evaluation/*_v1.json` 只绑定历史结果；旧事件反推必须显式传入兼容开关，新运行缺少真值侧车时直接失败。
 
 完整回归必须显式提供真实数据根目录：
 
