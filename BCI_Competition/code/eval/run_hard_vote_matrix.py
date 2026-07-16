@@ -9,7 +9,7 @@ import os
 import platform
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 
@@ -93,9 +93,23 @@ def _read_json(path: Path) -> dict:
     return payload
 
 
+def _portable_path_text(value: str | Path) -> str:
+    """把冻结清单中的 Windows 分隔符转为跨平台形式，不改写原 JSON。"""
+    return str(value).replace("\\", "/")
+
+
 def _safe_artifact(root: Path, relative_name: str) -> Path:
-    relative = Path(str(relative_name))
-    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+    # 历史正式清单由 Windows 生成，Linux 需要先统一分隔符。
+    # 同时用 PureWindowsPath 拒绝 C:\... 和 UNC 绝对路径，不能因兼容而放宽越界检查。
+    raw = str(relative_name)
+    relative = Path(_portable_path_text(raw))
+    if (
+        relative.is_absolute()
+        or PureWindowsPath(raw).is_absolute()
+        or bool(PureWindowsPath(raw).drive)
+        or ".." in relative.parts
+        or not relative.parts
+    ):
         raise RuntimeError(f"产物路径非法: {relative_name}")
     root = Path(root).resolve()
     resolved = (root / relative).resolve()
@@ -214,6 +228,12 @@ def _load_subject_inventory(subject: int):
     return context, inventory, contract, paths
 
 
+def _seed_score_path(input_subject_root: Path, input_manifest: dict, seed: int) -> Path:
+    """以实际 input-root 为基准解析 score，支持项目外的显式输入目录。"""
+    artifact = input_manifest["seed_artifacts"][str(seed)]["scores_and_decisions"]
+    return _safe_artifact(input_subject_root, artifact["file"])
+
+
 def _load_seed_logits(
     input_subject_root: Path,
     input_manifest: dict,
@@ -221,7 +241,7 @@ def _load_seed_logits(
     expected_rows: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     artifact = input_manifest["seed_artifacts"][str(seed)]["scores_and_decisions"]
-    path = _safe_artifact(input_subject_root, artifact["file"])
+    path = _seed_score_path(input_subject_root, input_manifest, seed)
     if not path.is_file() or file_hash(path) != artifact.get("sha256"):
         raise RuntimeError(f"seed {seed} 原始分数文件哈希不一致")
     with np.load(path, allow_pickle=False) as payload:
@@ -525,8 +545,8 @@ def run(args: argparse.Namespace) -> dict:
         )
         input_child = input_children[subject]
         if (
-            input_child.get("inputs", {}).get("bundle_manifest")
-            != display_path(paths.bundle_manifest)
+            _portable_path_text(input_child.get("inputs", {}).get("bundle_manifest", ""))
+            != _portable_path_text(display_path(paths.bundle_manifest))
             or input_child.get("inputs", {}).get("bundle_manifest_sha256")
             != context.manifest_sha256
         ):
