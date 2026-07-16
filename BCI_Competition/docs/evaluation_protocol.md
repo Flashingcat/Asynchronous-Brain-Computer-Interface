@@ -271,7 +271,9 @@ emitted_class, transition_reason
 - 在 `stateful_strict` 中，`WAIT_IDLE` 的 `emitted_class` 必须为 `-1`，从 `READY` 输出 MI 后必须立即进入 `WAIT_IDLE`，违反者属于无效决策轨迹并直接失败；
 - 在基础 `stateful_candidate` 中，MI 指令从 `TASK_CANDIDATE` 提交并立即进入 `WAIT_IDLE`；第 7.8 节允许 Fast-0 在 `READY` 中原子提交，但必须单独记录快速路径原因。候选打开、Stage 1 撤销、候选超时、各路径类别提交和 IDLE 复位都必须记录对应原因；
 - 因提前错误复位而在同一真实 MI 内再次产生的输出单独记录为额外事件内输出，不作为正常重复输出指标；
-- MI 已开始但尚未满足 0.5 秒 margin 的输出记录为过早输出；真实有效 `IDLE` 时间内的输出记录为 IDLE 误触发。
+- MI 已开始但尚未满足 0.5 秒 margin 的输出记录为过早输出；真实有效 `IDLE` 时间内的输出记录为 IDLE 误触发。这里按窗口右端的决策时刻分类：决策时刻恰好等于 MI onset、尚未读取任何 MI 采样的输出也属于 `too_early`，不属于 `idle_false`；窗口仍含历史 MI 信号、但决策时刻已经晚于 MI offset 的输出属于 `idle_false`。
+
+本协议中的正式 FAR 固定指“协议 FAR/min”：`idle_false_command_count / 有效 IDLE 分钟`，明确不包含 `too_early_command_count` 和 `additional_event_command_count`。这是一种按真值状态划分的口径，不等同于“所有缺少充分 MI 证据的无效指令率”。特别是决策时刻刚进入 MI、但尚未积累满 0.5 秒证据的输出不会增加协议 FAR；从真实在线控制和系统安全角度，它仍可能被视为不可接受的提前触发。因此，任何表格、图注或正文首次使用 FAR 时都必须注明“协议 FAR/min（不含过早输出）”，不得只凭该指标下降宣称系统的整体误触发风险下降，必须同时给出过早输出和额外事件内输出。
 
 在线基础结果必须报告：
 
@@ -279,9 +281,11 @@ emitted_class, transition_reason
 - 事件内触发率，即正确或错误类别输出的事件数除以可评分事件数；
 - 触发后类别准确率，即正确控制事件数除以事件内已触发事件数；
 - 漏检率、4×5 事件混淆矩阵、各类事件数和正确数；
-- IDLE 误触发次数及每分钟误触发率；分母为有效 segment 总时长减去其中全部真实 MI 时长，不得按窗口数近似；该墙钟时长明确包含零窗口短 segment 和长 segment 末尾不足一个步长的剩余采样，并同时报告这两部分审计量；
+- IDLE 误触发次数及协议 FAR/min（不含过早输出）；分母为有效 segment 总时长减去其中全部真实 MI 时长，不得按窗口数近似；该墙钟时长明确包含零窗口短 segment 和长 segment 末尾不足一个步长的剩余采样，并同时报告这两部分审计量；
 - 仅针对正确控制事件的检测延迟 `decision_time-MI_onset`，报告样本数、均值、中位数、Q1、Q3 和 P90；分位数采用 NumPy 默认的线性插值定义，延迟必须与正确事件率同时解释；
-- 不可评分事件数、过早输出数和额外事件内输出数作为审计量。
+- 不可评分事件数、过早输出数和额外事件内输出数作为审计量；解释协议 FAR 时必须把后两项并列展示，不能埋入附录或省略。
+
+为允许后续审查或派生更保守的无效指令口径，正式产物必须保留可重算的逐窗原始信息，而不能只保存汇总指标：窗口的 subject/session/run/segment、`window_index`、原生 `window_start_sample/window_stop_sample`，模型原始 logits 或学习型决策器的等价连续输出，`emitted_class`、决策前后状态及适用的 `transition_reason`。独立真值库存必须保留事件 onset、offset 和类别。指标文件还必须分别保存 `idle_false_command_count`、`too_early_command_count`、`additional_event_command_count` 及事件匹配结果。上述记录足以在不重新训练、不重新推理的条件下复核当前分类，并计算其他明确命名的派生指标；在新指标正式冻结前，不得把 `idle_false+too_early` 直接改名为 FAR，也不得与历史协议 FAR 混报。
 
 本轮不把上述指标加权成单一总分，也不据此确定多窗聚合、阈值、epoch 或状态机参数。
 
