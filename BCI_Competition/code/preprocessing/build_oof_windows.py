@@ -22,7 +22,7 @@ Arrays:
   run      int64, run index within session
   fold     int64, train-session validation fold id; -1 for test session
   split    int64, 0 train-session windows / 2 official test-session windows
-  segment, window_start, window_stop, event
+  segment, window_start, window_stop, decision_sample, event
   event_*  original annotation-event table used by causal event evaluation
 """
 
@@ -50,7 +50,7 @@ STRIDE_SAMPLES = 125
 LOW_HZ = 8.0
 HIGH_HZ = 30.0
 FILTER_ORDER = 4
-SCHEMA_VERSION = "bnci2014001_causal_windows_v2"
+SCHEMA_VERSION = "bnci2014001_causal_windows_v3"
 
 CLASS_TO_ID = {"left_hand": 1, "right_hand": 2, "feet": 3, "tongue": 4}
 CLASS_NAMES = ["idle", "left_hand", "right_hand", "feet", "tongue"]
@@ -202,7 +202,8 @@ def build_run_windows(
 
     # 保留原始 sample 位置和 segment 身份，避免删除坏片段后压缩时间轴。
     values: dict[str, list] = {
-        "X": [], "y": [], "segment": [], "window_start": [], "window_stop": [], "event": [],
+        "X": [], "y": [], "segment": [], "window_start": [], "window_stop": [],
+        "decision_sample": [], "event": [],
     }
     for segment_id, segment in enumerate(segments):
         filtered = causal_filter_segment(signal[:, segment.start : segment.stop])
@@ -215,6 +216,7 @@ def build_run_windows(
             values["segment"].append(segment_id)
             values["window_start"].append(global_start)
             values["window_stop"].append(global_stop)
+            values["decision_sample"].append(global_stop - 1)
             values["event"].append(-1 if event is None else event.event_id)
 
     count = len(values["y"])
@@ -222,7 +224,7 @@ def build_run_windows(
         "X": np.stack(values["X"]).astype(np.float32) if count else np.empty((0, 22, WINDOW_SAMPLES), dtype=np.float32),
         **{
             key: np.asarray(values[key], dtype=np.int64)
-            for key in ("y", "segment", "window_start", "window_stop", "event")
+            for key in ("y", "segment", "window_start", "window_stop", "decision_sample", "event")
         },
     }
     info = {
@@ -252,6 +254,7 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
         "segment": [],
         "window_start": [],
         "window_stop": [],
+        "decision_sample": [],
         "event": [],
     }
     event_arrays: dict[str, list[int]] = {

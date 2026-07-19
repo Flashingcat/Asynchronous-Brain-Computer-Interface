@@ -38,7 +38,7 @@ TABLE_DIR = PROJECT_ROOT / "results" / "tables" / "simple_oof"
 BINARY_CLASS_NAMES = ["idle", "task"]
 MI_CLASS_NAMES = ["left_hand", "right_hand", "feet", "tongue"]
 FINAL_CLASS_NAMES = ["idle", *MI_CLASS_NAMES]
-REQUIRED_SCHEMA = "bnci2014001_causal_windows_v2"
+REQUIRED_SCHEMA = "bnci2014001_causal_windows_v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,7 +160,6 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray, names: list[str]) -> dict:
 def effective_training_config(args: argparse.Namespace, arrays: dict[str, np.ndarray]) -> dict:
     """Return the complete model-affecting configuration stored with every artifact."""
     return {
-        "data_file": str(args.data_file.resolve()),
         "data_schema": REQUIRED_SCHEMA,
         "dataset_id": str(arrays["dataset_id"].item()),
         "dataset_config": json.loads(str(arrays["dataset_config"].item())),
@@ -342,6 +341,7 @@ def run_subject(
     paths = artifact_paths(subject, model_name, experiment_id)
     checkpoint, prediction_file, metrics_file = paths["checkpoint"], paths["predictions"], paths["metrics"]
     run_id = checkpoint.stem.removesuffix("_final")
+    provenance = {"data_file": str(args.data_file.resolve())}
 
     # checkpoint 先落盘并计算内容哈希，随后预测和指标都绑定这一个精确模型文件。
     torch.save(
@@ -352,6 +352,7 @@ def run_subject(
             "subject": subject,
             "seed": args.seed,
             "training_config": training_config,
+            "training_provenance": provenance,
             "binary_state_dict": final_binary.state_dict(),
             "mi_state_dict": final_mi.state_dict(),
             "mean": final_mean,
@@ -370,6 +371,7 @@ def run_subject(
         dataset_id=np.asarray(training_config["dataset_id"]),
         checkpoint_sha256=np.asarray(checkpoint_sha256),
         training_config=np.asarray(json.dumps(training_config, sort_keys=True, ensure_ascii=True)),
+        training_provenance=np.asarray(json.dumps(provenance, sort_keys=True, ensure_ascii=True)),
         index=oof_indices,
         y_true=oof_y,
         oof_binary_logits=oof_binary_logits,
@@ -384,10 +386,10 @@ def run_subject(
         "run_id": run_id,
         "subject": subject,
         "method": "leave_one_train_run_out_oof_then_final_all_train_runs",
-        "data_file": args.data_file.as_posix(),
         "model": model_name,
         "seed": args.seed,
         "training_config": training_config,
+        "training_provenance": provenance,
         "checkpoint_sha256": checkpoint_sha256,
         "folds": folds,
         "fold_reports": fold_reports,
@@ -423,7 +425,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device={device}, model={args.model}")
     reports = [run_subject(subject, arrays, args, device, training_config, experiment_id) for subject in subjects]
-    summary = {"experiment_id": experiment_id, "subjects": subjects, "training_config": training_config, "reports": reports}
+    summary = {
+        "experiment_id": experiment_id, "subjects": subjects,
+        "training_config": training_config,
+        "training_provenance": {"data_file": str(args.data_file.resolve())}, "reports": reports,
+    }
     summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved summary: {summary_file}")
 

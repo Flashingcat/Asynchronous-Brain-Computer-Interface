@@ -43,12 +43,20 @@ class TimelineTests(unittest.TestCase):
             arrays, returned_events, info = preprocessing.build_run_windows(object())
 
         np.testing.assert_array_equal(arrays["window_start"], [0, 125, 250, 1000, 1125, 1250, 1375, 1500])
+        np.testing.assert_array_equal(arrays["decision_sample"], arrays["window_stop"] - 1)
         np.testing.assert_array_equal(arrays["segment"], [0, 0, 0, 1, 1, 1, 1, 1])
         np.testing.assert_array_equal(arrays["y"], [1, 1, 1, 0, 2, 2, 2, 0])
         np.testing.assert_array_equal(arrays["event"], [0, 0, 0, -1, 1, 1, 1, -1])
         self.assertEqual(arrays["X"].shape, (8, 22, 500))
         self.assertEqual(returned_events, events)
         self.assertEqual(info, {"segments": 2, "task_events": 2, "excluded_events": 0, "artifacts": 1, "windows": 8})
+        commands = np.full(len(arrays["y"]), -1); commands[0] = 1
+        report = metric.event_metrics(
+            arrays["y"], commands, np.zeros(len(commands)), arrays["event"], arrays["decision_sample"],
+            {"run": np.asarray([0, 0]), "event": np.asarray([0, 1]), "label": np.asarray([1, 2]),
+             "start": np.asarray([400, 1500])}, sampling_rate=250,
+        )
+        self.assertAlmostEqual(report["mean_correct_latency_seconds"], 0.396)
 
     def test_trial_artifact_flag_removes_the_full_trial(self) -> None:
         class Run:
@@ -138,7 +146,7 @@ class EventMetricTests(unittest.TestCase):
         self.assertEqual(report["event_miss"], 1)
         self.assertEqual(report["idle_false_commands"], 1)
         self.assertAlmostEqual(report["event_hit_rate"], 2 / 3)
-        self.assertAlmostEqual(report["mean_latency_seconds"], 0.15)
+        self.assertAlmostEqual(report["mean_correct_latency_seconds"], 0.15)
 
     def test_wrong_first_command_does_not_enter_correct_latency(self) -> None:
         report = metric.event_metrics(
@@ -153,7 +161,7 @@ class EventMetricTests(unittest.TestCase):
         self.assertEqual(report["event_wrong_class"], 1)
         self.assertEqual(report["event_correct"], 1)
         self.assertEqual(report["additional_event_commands"], 1)
-        self.assertAlmostEqual(report["mean_latency_seconds"], 0.2)
+        self.assertAlmostEqual(report["mean_correct_latency_seconds"], 0.2)
         self.assertAlmostEqual(report["mean_wrong_command_latency_seconds"], 0.1)
 
     def test_unknown_window_event_is_rejected(self) -> None:
@@ -182,7 +190,7 @@ class ArtifactIdentityTests(unittest.TestCase):
             "accuracy": 0.7 + seed / 10000,
             "balanced_accuracy": 0.6,
             "event_hit_rate": 0.5,
-            "mean_latency_seconds": 0.75,
+            "mean_correct_latency_seconds": 0.75,
         }
 
     def test_summary_groups_only_comparable_checkpoints(self) -> None:
@@ -192,6 +200,12 @@ class ArtifactIdentityTests(unittest.TestCase):
         self.assertEqual(groups[1]["seeds"], [42, 43])
         self.assertEqual(groups[1]["seed_count"], 2)
         self.assertEqual(groups[2]["seeds"], [42])
+
+    def test_summary_reports_missing_latency_count(self) -> None:
+        first, second = self.report(1, 42), self.report(1, 43)
+        first["mean_correct_latency_seconds"] = None
+        latency = metric.grouped_summary([first, second])["groups"][0]["metrics"]["mean_correct_latency_seconds"]
+        self.assertEqual((latency["valid_count"], latency["missing_count"]), (1, 1))
 
     def test_duplicate_seed_in_comparable_group_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "duplicate seeds"):
@@ -222,6 +236,53 @@ class ArtifactIdentityTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(first, training.config_fingerprint({"seed": 42, "model": "eegnet"}))
 
+    def test_training_identity_ignores_data_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = Path(directory) / "first.npz", Path(directory) / "second.npz"
+            first.write_bytes(b"same data"); second.write_bytes(first.read_bytes())
+            base = dict(model="eegnet", binary_epochs=1, mi_epochs=1, batch_size=2,
+                        learning_rate=1e-3, seed=42, class_weight="none")
+            arrays = {"dataset_id": np.asarray("data"), "dataset_config": np.asarray("{}")}
+            one = training.effective_training_config(SimpleNamespace(data_file=first, **base), arrays)
+            two = training.effective_training_config(SimpleNamespace(data_file=second, **base), arrays)
+            self.assertEqual(one, two)
+
+    def test_evaluation_identity_ignores_paths_and_checkpoint_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.npz"
+            np.savez(data_file, dataset_id=np.asarray("data"))
+            args = SimpleNamespace(data=data_file, algorithm="argmax", batch_size=8, device="cpu")
+            first = {"path": Path("a.pt"), "subject": 2, "model": "eegnet", "seed": 43,
+                     "sha256": "b", "model_source_id": "source"}
+            second = {"path": Path("elsewhere.pt"), "subject": 1, "model": "eegnet", "seed": 42,
+                      "sha256": "a", "model_source_id": "source"}
+            one = evaluation.evaluation_config(args, [first, second])
+            first["path"], second["path"] = Path("moved.pt"), Path("other.pt")
+            two = evaluation.evaluation_config(args, [second, first])
+            self.assertEqual(one, two)
+
+    def test_checkpoint_manifest_releases_each_payload(self) -> None:
+        state = {"live": 0, "peak": 0}
+
+        class Checkpoint(dict):
+            def __init__(self, seed: int):
+                super().__init__(model="eegnet", subject=1, seed=seed,
+                                 training_config={"model_source_id": "source"})
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+
+            def __del__(self):
+                state["live"] -= 1
+
+        with (
+            patch.object(evaluation.torch, "load", side_effect=lambda path, **_: Checkpoint(int(path.stem))),
+            patch.object(evaluation, "file_sha256", side_effect=lambda path: path.stem),
+            patch.object(evaluation, "model_source_id", return_value="source"),
+        ):
+            manifest = evaluation.checkpoint_manifest([Path("43.pt"), Path("42.pt")])
+        self.assertEqual([item["seed"] for item in manifest], [42, 43])
+        self.assertEqual(state["peak"], 1)
+
     def test_subject_run_reseeds_before_data_checks(self) -> None:
         arrays = {"subject": np.asarray([1]), "split": np.asarray([2])}
         with patch.object(training, "set_seed") as reseed, self.assertRaisesRegex(RuntimeError, "No train-session"):
@@ -229,28 +290,32 @@ class ArtifactIdentityTests(unittest.TestCase):
         reseed.assert_called_once_with(9)
 
     def test_evaluation_rejects_changed_model_source(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            data_file = Path(directory) / "windows.npz"
-            one = np.asarray([1], dtype=np.int64)
-            empty = np.empty(0, dtype=np.int64)
-            np.savez(
-                data_file, X=np.zeros((1, 22, 500), dtype=np.float32), y=one, subject=one,
-                session=one, split=np.asarray([2]), run=np.asarray([0]), segment=np.asarray([0]),
-                window_stop=np.asarray([500]), event=np.asarray([-1]), event_subject=empty,
-                event_session=empty, event_run=empty, event_id=empty, event_label=empty, event_start=empty,
-                schema_version=np.asarray(evaluation.REQUIRED_SCHEMA), dataset_id=np.asarray("data"), sampling_rate=np.asarray(250),
-            )
-            checkpoint = {
-                "run_id": "run", "model": "eegnet", "subject": 1, "seed": 42,
-                "training_config": {"dataset_id": "data", "data_sha256": "hash", "model": "eegnet", "seed": 42,
-                                    "model_source_id": "old"},
-                "binary_state_dict": {}, "mi_state_dict": {}, "mean": np.zeros((1, 22, 1)), "std": np.ones((1, 22, 1)),
-            }
+        checkpoint = {
+            "run_id": "run", "model": "eegnet", "subject": 1, "seed": 42,
+            "training_config": {"dataset_id": "data", "data_sha256": "hash", "model": "eegnet", "seed": 42,
+                                "model_source_id": "old"},
+            "binary_state_dict": {}, "mi_state_dict": {}, "mean": np.zeros((1, 22, 1)), "std": np.ones((1, 22, 1)),
+        }
+        with patch.object(evaluation, "load_subject_test_data", return_value={"dataset_id": "data"}):
             with self.assertRaisesRegex(RuntimeError, "different model source"):
                 evaluation.evaluate_checkpoint(
-                    Path("checkpoint.pt"), checkpoint, SimpleNamespace(data=data_file), torch.device("cpu"),
+                    Path("checkpoint.pt"), checkpoint, SimpleNamespace(data=Path("data.npz")), torch.device("cpu"),
                     "hash", "checkpoint_hash", "current",
                 )
+
+    def test_empty_event_table_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "windows.npz"
+            one, empty = np.asarray([1]), np.empty(0, dtype=np.int64)
+            np.savez(
+                path, X=np.zeros((1, 22, 500)), y=one, subject=one, session=one, split=np.asarray([2]),
+                run=np.asarray([0]), segment=np.asarray([0]), decision_sample=np.asarray([499]), event=np.asarray([-1]),
+                event_subject=empty, event_session=empty, event_run=empty, event_id=empty, event_label=empty,
+                event_start=empty, schema_version=np.asarray(evaluation.REQUIRED_SCHEMA),
+                dataset_id=np.asarray("data"), sampling_rate=np.asarray(250),
+            )
+            with self.assertRaisesRegex(RuntimeError, "no test-session events"):
+                evaluation.load_subject_test_data(path, 1)
 
     def test_training_rejects_pre_repair_dataset_schema(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

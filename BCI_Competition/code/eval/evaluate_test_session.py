@@ -34,7 +34,7 @@ PROJECT_ROOT = CODE_ROOT.parent
 DEFAULT_DATA = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
 DEFAULT_PATTERN = PROJECT_ROOT / "results" / "checkpoints" / "**" / "*final.pt"
 TABLE_DIR = PROJECT_ROOT / "results" / "tables"
-REQUIRED_SCHEMA = "bnci2014001_causal_windows_v2"
+REQUIRED_SCHEMA = "bnci2014001_causal_windows_v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +79,7 @@ def load_subject_test_data(path: Path, subject: int) -> dict:
         raise FileNotFoundError(path)
     with np.load(path) as data:
         required = {
-            "X", "y", "subject", "session", "split", "run", "segment", "window_stop", "event",
+            "X", "y", "subject", "session", "split", "run", "segment", "decision_sample", "event",
             "event_subject", "event_session", "event_run", "event_id", "event_label", "event_start",
             "schema_version", "dataset_id", "sampling_rate",
         }
@@ -92,20 +92,31 @@ def load_subject_test_data(path: Path, subject: int) -> dict:
         if not mask.any():
             raise RuntimeError(f"subject {subject} has no labelled test-session rows")
         event_mask = (data["event_subject"] == subject) & (data["event_session"] == 1)
+        if not event_mask.any():
+            raise RuntimeError(f"subject {subject} has no test-session events")
+        runs = data["run"][mask].astype(np.int64)
+        decisions = data["decision_sample"][mask].astype(np.int64)
+        event_runs = data["event_run"][event_mask].astype(np.int64)
+        event_labels = data["event_label"][event_mask].astype(np.int64)
+        event_starts = data["event_start"][event_mask].astype(np.int64)
+        if np.any(~np.isin(event_labels, (1, 2, 3, 4))):
+            raise RuntimeError(f"subject {subject} has invalid test-session event labels")
+        if not set(runs.tolist()).issubset(event_runs.tolist()):
+            raise RuntimeError(f"subject {subject} test-session event runs do not match window runs")
         return {
             "X": data["X"][mask].astype(np.float32),
             "y": data["y"][mask].astype(np.int64),
-            "run": data["run"][mask].astype(np.int64),
+            "run": runs,
             "segment": data["segment"][mask].astype(np.int64),
             "event": data["event"][mask].astype(np.int64),
-            "window_stop": data["window_stop"][mask].astype(np.int64),
+            "decision_sample": decisions,
             "sampling_rate": int(data["sampling_rate"].item()),
             "dataset_id": str(data["dataset_id"].item()),
             "events": {
-                "run": data["event_run"][event_mask].astype(np.int64),
+                "run": event_runs,
                 "event": data["event_id"][event_mask].astype(np.int64),
-                "label": data["event_label"][event_mask].astype(np.int64),
-                "start": data["event_start"][event_mask].astype(np.int64),
+                "label": event_labels,
+                "start": event_starts,
             },
         }
 
@@ -172,23 +183,37 @@ def policy_config(args: argparse.Namespace) -> dict:
     return config
 
 
-# 评估身份固定数据、checkpoint 内容、当前模型/评估源码和运行时；同名路径不能掩盖内容变化。
-def evaluation_config(args: argparse.Namespace, checkpoints: list[tuple[Path, dict]]) -> dict:
+# 评估身份只保留影响结果的内容；本机路径单独作为 provenance 写入报告。
+def checkpoint_manifest(paths: list[Path]) -> list[dict]:
+    manifest = []
+    for path in paths:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        required = {"model", "subject", "seed", "training_config"}
+        missing = required.difference(checkpoint)
+        if missing:
+            raise RuntimeError(f"{path.name} is missing checkpoint metadata: {sorted(missing)}")
+        current_source = model_source_id(str(checkpoint["model"]))
+        manifest.append({
+            "path": path, "subject": int(checkpoint["subject"]), "model": str(checkpoint["model"]),
+            "seed": int(checkpoint["seed"]), "sha256": file_sha256(path), "model_source_id": current_source,
+        })
+        del checkpoint
+    manifest.sort(key=lambda item: (item["subject"], item["model"], item["seed"], item["sha256"]))
+    return manifest
+
+
+def evaluation_config(args: argparse.Namespace, manifest: list[dict]) -> dict:
     with np.load(args.data) as data:
         if "dataset_id" not in data:
             raise RuntimeError("data file has no dataset_id")
         dataset_id = str(data["dataset_id"].item())
     return {
-        "data": str(args.data.resolve()),
         "dataset_id": dataset_id,
         "data_sha256": file_sha256(args.data),
         "evaluator_source_id": evaluator_source_fingerprint(),
         "checkpoints": [
-            {
-                "path": str(path), "sha256": file_sha256(path),
-                "model_source_id": model_source_id(str(checkpoint.get("model", ""))),
-            }
-            for path, checkpoint in checkpoints
+            {key: item[key] for key in ("subject", "model", "seed", "sha256", "model_source_id")}
+            for item in sorted(manifest, key=lambda value: (value["subject"], value["model"], value["seed"], value["sha256"]))
         ],
         "runtime": {"python": platform.python_version(), "numpy": np.__version__, "torch": torch.__version__},
         "algorithm": args.algorithm,
@@ -221,7 +246,7 @@ def evaluator_source_fingerprint() -> str:
 
 def score_commands(data: dict, commands: np.ndarray) -> dict:
     report = event_metrics(
-        data["y"], commands, data["run"], data["event"], data["window_stop"], data["events"],
+        data["y"], commands, data["run"], data["event"], data["decision_sample"], data["events"],
         sampling_rate=data["sampling_rate"],
     )
     report.update(classification_metrics(data["y"], np.where(commands == -1, 0, commands)))
@@ -303,24 +328,26 @@ def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    checkpoint_paths = find_checkpoints(args)
-    checkpoints = [(path, torch.load(path, map_location="cpu", weights_only=False)) for path in checkpoint_paths]
-    config = evaluation_config(args, checkpoints)
+    manifest = checkpoint_manifest(find_checkpoints(args))
+    config = evaluation_config(args, manifest)
     evaluation_id = f"{args.algorithm}_{config_fingerprint(config)}"
     output = args.output or TABLE_DIR / f"test_{evaluation_id}.json"
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"output exists; pass --overwrite to replace it: {output}")
-    checkpoint_records = {Path(item["path"]): item for item in config["checkpoints"]}
-    reports = [
-        evaluate_checkpoint(
-            path, checkpoint, args, device, config["data_sha256"],
-            checkpoint_records[path]["sha256"], checkpoint_records[path]["model_source_id"],
-        )
-        for path, checkpoint in checkpoints
-    ]
+    reports = []
+    for item in manifest:
+        checkpoint = torch.load(item["path"], map_location="cpu", weights_only=False)
+        reports.append(evaluate_checkpoint(
+            item["path"], checkpoint, args, device, config["data_sha256"],
+            item["sha256"], item["model_source_id"],
+        ))
+        del checkpoint
     result = {
         "evaluation_id": evaluation_id, "split": "labelled_test_session_only",
         "algorithm": args.algorithm, "evaluation_config": config,
+        "evaluation_provenance": {
+            "data": str(args.data.resolve()), "checkpoints": [str(item["path"]) for item in manifest],
+        },
         "reports": reports, "summary": grouped_summary(reports),
         "warning": "Final hold-out results: do not select models or thresholds after reading this file.",
     }

@@ -95,11 +95,11 @@ def event_metrics(
         "event_hit_rate": None if not total else correct / total,
         "idle_false_commands": int(idle_false), "additional_event_commands": int(additional),
         "command_count": int(np.count_nonzero(emitted != -1)),
-        "mean_latency_seconds": None if not correct_latencies else float(np.mean(correct_latencies)),
-        "median_latency_seconds": None if not correct_latencies else float(np.median(correct_latencies)),
+        "mean_correct_latency_seconds": None if not correct_latencies else float(np.mean(correct_latencies)),
+        "median_correct_latency_seconds": None if not correct_latencies else float(np.median(correct_latencies)),
         "mean_wrong_command_latency_seconds": None if not wrong_latencies else float(np.mean(wrong_latencies)),
         "event_definition": "original annotation event_id within a run",
-        "latency_definition": "causal window_stop minus annotation onset; correct first commands only",
+        "latency_definition": "decision_sample minus annotation onset; correct first commands only",
     }
 
 
@@ -110,7 +110,7 @@ def policy_diagnostics(reasons: tuple[str | None, ...]) -> dict:
 
 def grouped_summary(reports: list[dict]) -> dict:
     """Aggregate seeds only inside matching subject/model/training configurations."""
-    keys = ("accuracy", "balanced_accuracy", "event_hit_rate", "mean_latency_seconds")
+    keys = ("accuracy", "balanced_accuracy", "event_hit_rate", "mean_correct_latency_seconds")
     # 只移除 seed，其余数据、训练器和超参必须完全一致才能汇总。
     groups: dict[str, tuple[dict, list[dict]]] = {}
     for report in reports:
@@ -138,4 +138,6 @@ def _mean_std(values: list[float | None]) -> dict:
     return {
         "mean": None if not present else float(np.mean(present)),
         "std": None if not present else float(np.std(present)),
+        "valid_count": len(present),
+        "missing_count": len(values) - len(present),
     }
