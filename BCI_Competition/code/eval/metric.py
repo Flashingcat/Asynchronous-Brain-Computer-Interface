@@ -116,7 +116,8 @@ def grouped_summary(reports: list[dict]) -> dict:
         "window_classification": ("accuracy", "balanced_accuracy"),
         "command_policy": (
             "event_hit_rate", "event_wrong_class_rate", "event_miss_rate",
-            "mean_correct_latency_seconds", "idle_false_commands", "additional_event_commands",
+            "mean_correct_latency_seconds", "idle_false_commands", "idle_false_commands_per_minute",
+            "additional_event_commands",
         ),
     }
     # 只移除 seed，其余数据、训练器和超参必须完全一致才能汇总。

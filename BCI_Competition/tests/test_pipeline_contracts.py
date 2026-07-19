@@ -91,13 +91,14 @@ class PipelineContractTests(unittest.TestCase):
         data = {"y": np.asarray([1, 1, 1, 1, 0]), "run": np.zeros(5),
                 "event": np.asarray([0, 0, 1, 1, -1]),
                 "decision_sample": np.asarray([600, 700, 1500, 1600, 1700]),
-                "events": events, "sampling_rate": 1000}
+                "events": events, "sampling_rate": 1000, "stride_samples": 500}
         report = evaluation.command_metrics(data, np.asarray([2, 1, -1, 1, 2]))
         self.assertNotIn("balanced_accuracy", report)
         self.assertEqual((report["event_correct"], report["event_wrong_class"], report["event_miss"]), (1, 1, 1))
         self.assertAlmostEqual(report["mean_correct_latency_seconds"], 0.2)
         self.assertAlmostEqual(report["mean_wrong_command_latency_seconds"], 0.1)
         self.assertEqual((report["additional_event_commands"], report["idle_false_commands"]), (1, 1))
+        self.assertEqual(report["idle_false_commands_per_minute"], 120)
 
     # 汇总只能合并除 seed 外身份一致的结果，并显式报告缺失延迟。
     def test_grouped_summary_rejects_incomparable_or_duplicate_runs(self) -> None:
@@ -107,7 +108,8 @@ class PipelineContractTests(unittest.TestCase):
                     "window_classification": {"accuracy": 0.7, "balanced_accuracy": 0.6},
                     "command_policy": {"event_hit_rate": 0.5, "event_wrong_class_rate": 0.2,
                                        "event_miss_rate": 0.3, "mean_correct_latency_seconds": latency,
-                                       "idle_false_commands": 1, "additional_event_commands": 0}}
+                                       "idle_false_commands": 1, "idle_false_commands_per_minute": 0.2,
+                                       "additional_event_commands": 0}}
         summary = metric.grouped_summary([report(42, latency=None), report(43), report(44, source="other")])
         self.assertEqual(summary["group_count"], 2)
         latency = next(group for group in summary["groups"] if group["seed_count"] == 2)["metrics"]["command_policy"]["mean_correct_latency_seconds"]
@@ -166,7 +168,7 @@ class PipelineContractTests(unittest.TestCase):
                 run=np.asarray([0]), segment=np.asarray([0]), decision_sample=np.asarray([499]), event=np.asarray([-1]),
                 event_subject=empty, event_session=empty, event_run=empty, event_id=empty,
                 event_label=empty, event_start=empty, schema_version=np.asarray(evaluation.REQUIRED_SCHEMA),
-                dataset_id=np.asarray("data"), sampling_rate=np.asarray(250),
+                dataset_id=np.asarray("data"), sampling_rate=np.asarray(250), stride_samples=np.asarray(125),
             )
             with self.assertRaisesRegex(RuntimeError, "no test-session events"):
                 evaluation.load_subject_test_data(path, 1)

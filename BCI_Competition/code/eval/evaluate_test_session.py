@@ -81,7 +81,7 @@ def load_subject_test_data(path: Path, subject: int) -> dict:
         required = {
             "X", "y", "subject", "session", "split", "run", "segment", "decision_sample", "event",
             "event_subject", "event_session", "event_run", "event_id", "event_label", "event_start",
-            "schema_version", "dataset_id", "sampling_rate",
+            "schema_version", "dataset_id", "sampling_rate", "stride_samples",
         }
         missing = required.difference(data.files)
         if missing:
@@ -111,6 +111,7 @@ def load_subject_test_data(path: Path, subject: int) -> dict:
             "event": data["event"][mask].astype(np.int64),
             "decision_sample": decisions,
             "sampling_rate": int(data["sampling_rate"].item()),
+            "stride_samples": int(data["stride_samples"].item()),
             "dataset_id": str(data["dataset_id"].item()),
             "events": {
                 "run": event_runs,
@@ -245,10 +246,15 @@ def evaluator_source_fingerprint() -> str:
 
 
 def command_metrics(data: dict, commands: np.ndarray) -> dict:
-    return event_metrics(
+    report = event_metrics(
         data["y"], commands, data["run"], data["event"], data["decision_sample"], data["events"],
         sampling_rate=data["sampling_rate"],
     )
+    # 用保留的空闲决策窗口折算有效时长，坏片段不会进入误触发率分母。
+    idle_minutes = np.count_nonzero(data["y"] == 0) * data["stride_samples"] / data["sampling_rate"] / 60
+    report["idle_duration_minutes"] = float(idle_minutes)
+    report["idle_false_commands_per_minute"] = None if not idle_minutes else report["idle_false_commands"] / idle_minutes
+    return report
 
 
 def evaluate_checkpoint(
