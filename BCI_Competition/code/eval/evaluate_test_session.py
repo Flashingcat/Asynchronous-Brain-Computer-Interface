@@ -244,13 +244,11 @@ def evaluator_source_fingerprint() -> str:
     return digest.hexdigest()[:12]
 
 
-def score_commands(data: dict, commands: np.ndarray) -> dict:
-    report = event_metrics(
+def command_metrics(data: dict, commands: np.ndarray) -> dict:
+    return event_metrics(
         data["y"], commands, data["run"], data["event"], data["decision_sample"], data["events"],
         sampling_rate=data["sampling_rate"],
     )
-    report.update(classification_metrics(data["y"], np.where(commands == -1, 0, commands)))
-    return report
 
 
 def evaluate_checkpoint(
@@ -291,16 +289,16 @@ def evaluate_checkpoint(
     stage1_logits, _ = infer(stage1, x, device, args.batch_size, need_features=False)
     need_features = args.algorithm == "feature"
     stage2_logits, stage2_features = infer(stage2, x, device, args.batch_size, need_features=need_features)
+    dense_prediction = argmax_predict(stage1_logits, stage2_logits)
+    report = {"window_classification": classification_metrics(data["y"], dense_prediction)}
     reset_ids = continuous_ids(data["run"], data["segment"])
     if args.algorithm == "argmax":
-        prediction = argmax_predict(stage1_logits, stage2_logits)
-        report = score_commands(data, np.where(prediction == 0, -1, prediction))
+        commands = np.where(dense_prediction == 0, -1, dense_prediction)
     elif args.algorithm == "hard_vote":
-        output = hard_vote_commands(
+        commands = hard_vote_commands(
             stage1_logits, stage2_logits, window_count=args.vote_windows,
             vote_threshold=args.vote_threshold, run_ids=reset_ids,
         )
-        report = score_commands(data, output)
     else:
         config = config_from_args(args)
         if args.algorithm == "fast":
@@ -311,8 +309,10 @@ def evaluate_checkpoint(
             output = feature_gate_commands(stage1_logits, stage2_logits, stage2_features, config, run_ids=reset_ids)
         else:
             output = candidate_commands(stage1_logits, stage2_logits, config, run_ids=reset_ids)
-        report = score_commands(data, output.commands)
-        report["diagnostics"] = policy_diagnostics(output.reasons)
+        commands = output.commands
+    report["command_policy"] = command_metrics(data, commands)
+    if args.algorithm not in {"argmax", "hard_vote"}:
+        report["command_policy"]["diagnostics"] = policy_diagnostics(output.reasons)
     report.update({
         "checkpoint": str(path), "run_id": checkpoint["run_id"],
         "checkpoint_sha256": checkpoint_sha256,

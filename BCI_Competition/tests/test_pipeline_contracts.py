@@ -88,11 +88,12 @@ class PipelineContractTests(unittest.TestCase):
     def test_event_metric_separates_first_commands(self) -> None:
         events = {"run": np.asarray([0, 0, 0]), "event": np.asarray([0, 1, 2]),
                   "label": np.asarray([1, 1, 3]), "start": np.asarray([500, 1400, 2000])}
-        report = metric.event_metrics(
-            np.asarray([1, 1, 1, 1, 0]), np.asarray([2, 1, -1, 1, 2]), np.zeros(5),
-            np.asarray([0, 0, 1, 1, -1]), np.asarray([600, 700, 1500, 1600, 1700]),
-            events, sampling_rate=1000,
-        )
+        data = {"y": np.asarray([1, 1, 1, 1, 0]), "run": np.zeros(5),
+                "event": np.asarray([0, 0, 1, 1, -1]),
+                "decision_sample": np.asarray([600, 700, 1500, 1600, 1700]),
+                "events": events, "sampling_rate": 1000}
+        report = evaluation.command_metrics(data, np.asarray([2, 1, -1, 1, 2]))
+        self.assertNotIn("balanced_accuracy", report)
         self.assertEqual((report["event_correct"], report["event_wrong_class"], report["event_miss"]), (1, 1, 1))
         self.assertAlmostEqual(report["mean_correct_latency_seconds"], 0.2)
         self.assertAlmostEqual(report["mean_wrong_command_latency_seconds"], 0.1)
@@ -103,11 +104,13 @@ class PipelineContractTests(unittest.TestCase):
         def report(seed: int, source: str = "same", latency: float | None = 0.75) -> dict:
             return {"checkpoint": f"{seed}.pt", "subject": 1, "model": "eegnet", "seed": seed,
                     "training_config": {"model": "eegnet", "seed": seed, "source_id": source},
-                    "accuracy": 0.7, "balanced_accuracy": 0.6, "event_hit_rate": 0.5,
-                    "mean_correct_latency_seconds": latency}
+                    "window_classification": {"accuracy": 0.7, "balanced_accuracy": 0.6},
+                    "command_policy": {"event_hit_rate": 0.5, "event_wrong_class_rate": 0.2,
+                                       "event_miss_rate": 0.3, "mean_correct_latency_seconds": latency,
+                                       "idle_false_commands": 1, "additional_event_commands": 0}}
         summary = metric.grouped_summary([report(42, latency=None), report(43), report(44, source="other")])
         self.assertEqual(summary["group_count"], 2)
-        latency = next(group for group in summary["groups"] if group["seed_count"] == 2)["metrics"]["mean_correct_latency_seconds"]
+        latency = next(group for group in summary["groups"] if group["seed_count"] == 2)["metrics"]["command_policy"]["mean_correct_latency_seconds"]
         self.assertEqual((latency["valid_count"], latency["missing_count"]), (1, 1))
         with self.assertRaisesRegex(ValueError, "duplicate seeds"):
             metric.grouped_summary([report(42), report(42)])

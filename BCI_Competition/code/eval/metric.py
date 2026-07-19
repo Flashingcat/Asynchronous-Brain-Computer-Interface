@@ -93,6 +93,8 @@ def event_metrics(
     return {
         "event_count": total, "event_correct": correct, "event_wrong_class": wrong, "event_miss": miss,
         "event_hit_rate": None if not total else correct / total,
+        "event_wrong_class_rate": None if not total else wrong / total,
+        "event_miss_rate": None if not total else miss / total,
         "idle_false_commands": int(idle_false), "additional_event_commands": int(additional),
         "command_count": int(np.count_nonzero(emitted != -1)),
         "mean_correct_latency_seconds": None if not correct_latencies else float(np.mean(correct_latencies)),
@@ -110,7 +112,13 @@ def policy_diagnostics(reasons: tuple[str | None, ...]) -> dict:
 
 def grouped_summary(reports: list[dict]) -> dict:
     """Aggregate seeds only inside matching subject/model/training configurations."""
-    keys = ("accuracy", "balanced_accuracy", "event_hit_rate", "mean_correct_latency_seconds")
+    metrics = {
+        "window_classification": ("accuracy", "balanced_accuracy"),
+        "command_policy": (
+            "event_hit_rate", "event_wrong_class_rate", "event_miss_rate",
+            "mean_correct_latency_seconds", "idle_false_commands", "additional_event_commands",
+        ),
+    }
     # 只移除 seed，其余数据、训练器和超参必须完全一致才能汇总。
     groups: dict[str, tuple[dict, list[dict]]] = {}
     for report in reports:
@@ -128,7 +136,10 @@ def grouped_summary(reports: list[dict]) -> dict:
         seeds = [item["seed"] for item in items]
         if len(set(seeds)) != len(seeds):
             raise ValueError(f"duplicate seeds for comparable checkpoint group: {seeds}")
-        summary = {metric: _mean_std([item.get(metric) for item in items]) for metric in keys}
+        summary = {
+            section: {name: _mean_std([item.get(section, {}).get(name) for item in items]) for name in names}
+            for section, names in metrics.items()
+        }
         output.append({**identity, "seed_count": len(items), "seeds": sorted(seeds), "metrics": summary})
     return {"group_count": len(output), "groups": output}
 
