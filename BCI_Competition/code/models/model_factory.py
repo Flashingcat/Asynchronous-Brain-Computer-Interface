@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from argparse import Namespace
 from pathlib import Path
@@ -47,6 +48,15 @@ def model_source(model_name: str) -> Path:
     """Return the source file for a registered model."""
     file_name, _ = MODEL_SPECS[normalize_model_name(model_name)]
     return MODEL_DIR / file_name
+
+
+# 模型身份同时覆盖注册表和实际网络实现；评估必须与训练时保存的值一致。
+def model_source_id(model_name: str) -> str:
+    digest = hashlib.sha256()
+    for path in (Path(__file__).resolve(), model_source(model_name)):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
 
 
 def build_model(model_name: str, num_classes: int, chans: int, samples: int) -> nn.Module:

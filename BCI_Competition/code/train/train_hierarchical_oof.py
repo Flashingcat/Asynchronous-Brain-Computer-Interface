@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import platform
 import random
 import sys
 from pathlib import Path
@@ -27,7 +29,7 @@ from torch.utils.data import DataLoader, TensorDataset
 PROJECT_ROOT = Path("BCI_Competition") if Path("BCI_Competition/code").is_dir() else Path(".")
 sys.path.insert(0, str(PROJECT_ROOT / "code"))
 
-from models.model_factory import available_models, build_model, model_source, normalize_model_name
+from models.model_factory import available_models, build_model, model_source, model_source_id, normalize_model_name
 
 
 DATA_FILE = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
@@ -36,6 +38,7 @@ TABLE_DIR = PROJECT_ROOT / "results" / "tables" / "simple_oof"
 BINARY_CLASS_NAMES = ["idle", "task"]
 MI_CLASS_NAMES = ["left_hand", "right_hand", "feet", "tongue"]
 FINAL_CLASS_NAMES = ["idle", *MI_CLASS_NAMES]
+REQUIRED_SCHEMA = "bnci2014001_causal_windows_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--class-weight", choices=("none", "balanced"), default="balanced")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -63,10 +67,15 @@ def set_seed(seed: int) -> None:
 
 def load_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path) as data:
-        required = ["X", "y", "subject", "session", "run", "fold", "split"]
+        required = [
+            "X", "y", "subject", "session", "run", "fold", "split",
+            "schema_version", "dataset_id", "dataset_config",
+        ]
         missing = [key for key in required if key not in data]
         if missing:
             raise RuntimeError(f"Missing arrays in {path}: {missing}")
+        if str(data["schema_version"].item()) != REQUIRED_SCHEMA:
+            raise RuntimeError(f"Expected data schema {REQUIRED_SCHEMA}")
         return {key: data[key] for key in required}
 
 
@@ -147,6 +156,69 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray, names: list[str]) -> dict:
     }
 
 
+# 运行身份只由真正影响训练的生效配置生成，同一身份的所有产物共用同一前缀。
+def effective_training_config(args: argparse.Namespace, arrays: dict[str, np.ndarray]) -> dict:
+    """Return the complete model-affecting configuration stored with every artifact."""
+    return {
+        "data_file": str(args.data_file.resolve()),
+        "data_schema": REQUIRED_SCHEMA,
+        "dataset_id": str(arrays["dataset_id"].item()),
+        "dataset_config": json.loads(str(arrays["dataset_config"].item())),
+        "data_sha256": file_sha256(args.data_file),
+        "source_id": source_fingerprint(args.model),
+        "model_source_id": model_source_id(args.model),
+        "runtime": {"python": platform.python_version(), "numpy": np.__version__, "torch": torch.__version__},
+        "trainer": "hierarchical_oof_v2",
+        "model": args.model,
+        "binary_epochs": args.binary_epochs,
+        "mi_epochs": args.mi_epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "seed": args.seed,
+        "class_weight": args.class_weight,
+    }
+
+
+def config_fingerprint(config: dict) -> str:
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_fingerprint(model_name: str) -> str:
+    digest = hashlib.sha256()
+    paths = [Path(__file__).resolve(), PROJECT_ROOT / "code" / "models" / "model_factory.py", model_source(model_name)]
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def artifact_paths(subject: int, model_name: str, experiment_id: str) -> dict[str, Path]:
+    prefix = f"s{subject:02d}_{model_name}_{experiment_id}"
+    return {
+        "checkpoint": CHECKPOINT_DIR / f"{prefix}_final.pt",
+        "predictions": TABLE_DIR / f"{prefix}_predictions.npz",
+        "metrics": TABLE_DIR / f"{prefix}_metrics.json",
+    }
+
+
+def ensure_writable(paths: list[Path], overwrite: bool) -> None:
+    if len(set(paths)) != len(paths):
+        raise ValueError("duplicate artifact targets")
+    existing = [path for path in paths if path.exists()]
+    if existing and not overwrite:
+        joined = "\n".join(str(path) for path in existing)
+        raise FileExistsError(f"artifacts already exist; pass --overwrite to replace them:\n{joined}")
+
+
 def train_stage_pair(
     model_name: str,
     features: np.ndarray,
@@ -191,7 +263,16 @@ def train_stage_pair(
     return binary_model, mi_model
 
 
-def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Namespace, device: torch.device) -> dict:
+def run_subject(
+    subject: int,
+    arrays: dict[str, np.ndarray],
+    args: argparse.Namespace,
+    device: torch.device,
+    training_config: dict,
+    experiment_id: str,
+) -> dict:
+    # 每个受试者从同一显式 seed 独立开始，结果不依赖本次命令还训练了哪些受试者。
+    set_seed(args.seed)
     model_name = normalize_model_name(args.model)
     subject_mask = arrays["subject"] == subject
     train_session = subject_mask & (arrays["split"] == 0)
@@ -258,18 +339,19 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         ),
     }
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
-    prefix = f"s{subject:02d}_{model_name}_oof"
-    checkpoint = CHECKPOINT_DIR / f"{prefix}_final.pt"
-    prediction_file = TABLE_DIR / f"{prefix}_predictions.npz"
-    metrics_file = TABLE_DIR / f"{prefix}_metrics.json"
+    paths = artifact_paths(subject, model_name, experiment_id)
+    checkpoint, prediction_file, metrics_file = paths["checkpoint"], paths["predictions"], paths["metrics"]
+    run_id = checkpoint.stem.removesuffix("_final")
 
+    # checkpoint 先落盘并计算内容哈希，随后预测和指标都绑定这一个精确模型文件。
     torch.save(
         {
+            "run_id": run_id,
             "model": model_name,
             "model_source": str(model_source(model_name)),
             "subject": subject,
+            "seed": args.seed,
+            "training_config": training_config,
             "binary_state_dict": final_binary.state_dict(),
             "mi_state_dict": final_mi.state_dict(),
             "mean": final_mean,
@@ -278,8 +360,16 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         },
         checkpoint,
     )
+    checkpoint_sha256 = file_sha256(checkpoint)
     np.savez_compressed(
         prediction_file,
+        run_id=np.asarray(run_id),
+        subject=np.asarray(subject, dtype=np.int64),
+        model=np.asarray(model_name),
+        seed=np.asarray(args.seed, dtype=np.int64),
+        dataset_id=np.asarray(training_config["dataset_id"]),
+        checkpoint_sha256=np.asarray(checkpoint_sha256),
+        training_config=np.asarray(json.dumps(training_config, sort_keys=True, ensure_ascii=True)),
         index=oof_indices,
         y_true=oof_y,
         oof_binary_logits=oof_binary_logits,
@@ -291,11 +381,14 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     )
     report = {
         "dataset": "BNCI2014001",
+        "run_id": run_id,
         "subject": subject,
         "method": "leave_one_train_run_out_oof_then_final_all_train_runs",
         "data_file": args.data_file.as_posix(),
         "model": model_name,
         "seed": args.seed,
+        "training_config": training_config,
+        "checkpoint_sha256": checkpoint_sha256,
         "folds": folds,
         "fold_reports": fold_reports,
         "oof_metrics": oof_metrics,
@@ -313,15 +406,25 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
 def main() -> None:
     args = parse_args()
     args.model = normalize_model_name(args.model)
-    set_seed(args.seed)
     arrays = load_arrays(args.data_file)
     subjects = sorted(np.unique(arrays["subject"]).astype(int).tolist()) if args.all_subjects else args.subjects
+    if len(set(subjects)) != len(subjects):
+        raise ValueError("subjects must not contain duplicates")
+    subjects = sorted(subjects)
+    training_config = effective_training_config(args, arrays)
+    experiment_id = f"seed{args.seed}_{config_fingerprint(training_config)}"
+    subject_tag = "-".join(f"s{subject:02d}" for subject in subjects)
+    summary_file = TABLE_DIR / f"{args.model}_{experiment_id}_{subject_tag}_oof_summary.json"
+    # 在启动耗时训练前一次性检查全部目标，避免中途才发现覆盖冲突。
+    planned = [path for subject in subjects for path in artifact_paths(subject, args.model, experiment_id).values()]
+    ensure_writable([*planned, summary_file], args.overwrite)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device={device}, model={args.model}")
-    reports = [run_subject(subject, arrays, args, device) for subject in subjects]
-    summary_file = TABLE_DIR / f"{args.model}_oof_summary.json"
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
-    summary_file.write_text(json.dumps(reports, indent=2, ensure_ascii=False), encoding="utf-8")
+    reports = [run_subject(subject, arrays, args, device, training_config, experiment_id) for subject in subjects]
+    summary = {"experiment_id": experiment_id, "subjects": subjects, "training_config": training_config, "reports": reports}
+    summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved summary: {summary_file}")
 
 
