@@ -37,22 +37,22 @@
 
 ```bash
 # 单一增强
-conda run -n medical_img python BCI_Competition/code/augmentation/train_augmented.py \
+python BCI_Competition/code/augmentation/train_augmented.py \
     --model eegnet --subjects 1 --augment noise_trial --binary-epochs 30 --mi-epochs 30
 
 # 多种增强组合
-conda run -n medical_img python BCI_Competition/code/augmentation/train_augmented.py \
+python BCI_Competition/code/augmentation/train_augmented.py \
     --model eegnet --subjects 1 --augment noise_trial freq_shift --binary-epochs 30 --mi-epochs 30
 
 # 全部方法
-conda run -n medical_img python BCI_Competition/code/augmentation/train_augmented.py \
+python BCI_Competition/code/augmentation/train_augmented.py \
     --model eegnet --subjects 1 --augment all --binary-epochs 30 --mi-epochs 30
 ```
 
 ### 评测
 
 ```bash
-conda run -n medical_img python BCI_Competition/code/eval/evaluate_test_session.py \
+python BCI_Competition/code/eval/evaluate_test_session.py \
     --algorithm argmax \
     --checkpoints results/checkpoints/augmented/s01_eegnet_noise_trial_final.pt \
     --output results/eegnet_noise_trial_metrics.json
