@@ -23,6 +23,8 @@ Arrays:
   fold     int64, train-session validation fold id; -1 for test session
   split    int64, 0 train-session windows / 2 official test-session windows
   segment  independent clean segment id within a run
+  decision_sample  original sample where the window decision is made
+  is_pure  bool, whether the window is fully idle or fully inside one MI event
 """
 
 from __future__ import annotations
@@ -105,7 +107,12 @@ def task_events(raw: mne.io.BaseRaw) -> list[TaskEvent]:
             continue
         start = int(round(float(onset_s) * SAMPLING_RATE))
         stop = int(round((float(onset_s) + float(duration_s)) * SAMPLING_RATE))
-        events.append(TaskEvent(start=start, stop=stop, label=CLASS_TO_ID[name], name=name))
+        events.append(TaskEvent(
+            start=start,
+            stop=stop,
+            label=CLASS_TO_ID[name],
+            name=name,
+        ))
     return events
 
 
@@ -181,10 +188,18 @@ def label_window(start: int, stop: int, events: list[TaskEvent]) -> int | None:
     return contained[0].label if len(contained) == 1 and len(overlapping) == 1 else None
 
 
+def event_at(sample: int, events: list[TaskEvent]) -> TaskEvent | None:
+    active = [event for event in events if event.start <= sample < event.stop]
+    if len(active) > 1:
+        raise RuntimeError(f"overlapping task annotations at sample {sample}")
+    return active[0] if active else None
+
+
 def build_run_windows(
     raw: mne.io.BaseRaw,
     trial_artifacts: list[tuple[int, int]] | None = None,
-) -> tuple[dict[str, np.ndarray], dict]:
+    pure_only: bool = True,
+) -> tuple[dict[str, np.ndarray], list[TaskEvent], dict]:
     signal = eeg_data(raw)
     all_events = task_events(raw)
     artifacts = sorted(set([*artifact_intervals(raw), *(trial_artifacts or [])]))
@@ -195,28 +210,45 @@ def build_run_windows(
     segments = clean_segments(signal.shape[1], artifacts)
 
     # 保留原始 sample 位置和 segment 身份，避免删除坏片段后压缩时间轴。
-    values: dict[str, list] = {"X": [], "y": [], "segment": []}
+    values: dict[str, list] = {
+        "X": [],
+        "y": [],
+        "segment": [],
+        "decision_sample": [],
+        "is_pure": [],
+    }
     dropped_boundary = 0
     for segment_id, segment in enumerate(segments):
         filtered = causal_filter_segment(signal[:, segment.start : segment.stop])
         for local_start in range(0, filtered.shape[1] - WINDOW_SAMPLES + 1, STRIDE_SAMPLES):
             global_start = segment.start + local_start
             global_stop = global_start + WINDOW_SAMPLES
-            label = label_window(global_start, global_stop, events)
-            if label is None:
-                dropped_boundary += 1
-                continue
+            pure_label = label_window(global_start, global_stop, events)
+
+            # 训练删除混合窗口；测试保留完整流并按决策时刻标注。
+            if pure_only:
+                if pure_label is None:
+                    dropped_boundary += 1
+                    continue
+                label = pure_label
+            else:
+                event = event_at(global_stop - 1, events)
+                label = 0 if event is None else event.label
+
             values["X"].append(filtered[:, local_start : local_start + WINDOW_SAMPLES])
             values["y"].append(label)
             values["segment"].append(segment_id)
+            values["decision_sample"].append(global_stop - 1)
+            values["is_pure"].append(pure_label is not None)
 
     count = len(values["y"])
     arrays = {
         "X": np.stack(values["X"]).astype(np.float32) if count else np.empty((0, 22, WINDOW_SAMPLES), dtype=np.float32),
         **{
             key: np.asarray(values[key], dtype=np.int64)
-            for key in ("y", "segment")
+            for key in ("y", "segment", "decision_sample")
         },
+        "is_pure": np.asarray(values["is_pure"], dtype=bool),
     }
     info = {
         "segments": len(segments),
@@ -225,7 +257,7 @@ def build_run_windows(
         "windows": count,
         "dropped_boundary": dropped_boundary,
     }
-    return arrays, info
+    return arrays, events, info
 
 
 def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict]]:
@@ -243,6 +275,15 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
         "fold": [],
         "split": [],
         "segment": [],
+        "decision_sample": [],
+        "is_pure": [],
+    }
+    event_arrays: dict[str, list[int]] = {
+        "event_subject": [],
+        "event_run": [],
+        "event_label": [],
+        "event_start": [],
+        "event_stop": [],
     }
     records: list[dict] = []
 
@@ -256,7 +297,9 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
                 artifact_key = (session_id, run_index)
                 if artifact_key not in trial_artifacts:
                     raise RuntimeError(f"missing source artifact flags for subject {subject}, run {artifact_key}")
-                run_arrays, info = build_run_windows(raw, trial_artifacts[artifact_key])
+                run_arrays, events, info = build_run_windows(
+                    raw, trial_artifacts[artifact_key], pure_only=is_train_session
+                )
                 n = len(run_arrays["y"])
                 for key, value in run_arrays.items():
                     arrays[key].append(value)
@@ -265,6 +308,13 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
                 arrays["run"].append(np.full(n, run_index, dtype=np.int64))
                 arrays["fold"].append(np.full(n, run_index if is_train_session else -1, dtype=np.int64))
                 arrays["split"].append(np.full(n, split_id, dtype=np.int64))
+                if not is_train_session:
+                    for event in events:
+                        event_arrays["event_subject"].append(subject)
+                        event_arrays["event_run"].append(run_index)
+                        event_arrays["event_label"].append(event.label)
+                        event_arrays["event_start"].append(event.start)
+                        event_arrays["event_stop"].append(event.stop)
                 record = {
                     "subject": subject,
                     "session": session_name,
@@ -281,8 +331,11 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
         key: np.concatenate(value, axis=0) if key != "X" else np.concatenate(value, axis=0).astype(np.float32)
         for key, value in arrays.items()
     }
+    output.update({key: np.asarray(value, dtype=np.int64) for key, value in event_arrays.items()})
+    output["sampling_rate"] = np.asarray(SAMPLING_RATE, dtype=np.int64)
     return output, records
-    # 数据身份由受试者集合和全部生效预处理参数确定，不依赖本机路径。
+
+
 def write_outputs(output_file: Path, arrays: dict[str, np.ndarray]) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_file, **arrays)

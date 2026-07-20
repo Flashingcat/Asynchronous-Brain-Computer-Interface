@@ -19,13 +19,23 @@ from algorithms.candidate import CandidateConfig, commands as candidate_commands
 from algorithms.fast_path import commands as fast_path_commands
 from algorithms.feature_gate import commands as feature_gate_commands
 from algorithms.hard_vote import commands as hard_vote_commands
-from metric import classification_metrics, event_metrics, policy_diagnostics, report_summary
+from metric import (
+    classification_metrics,
+    continuous_event_metrics,
+    legacy_event_metrics,
+    policy_diagnostics,
+    report_summary,
+)
 from models.model_factory import build_model
 
 
 PROJECT_ROOT = CODE_ROOT.parent
 DEFAULT_DATA = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
 DEFAULT_PATTERN = PROJECT_ROOT / "results" / "checkpoints" / "**" / "*final.pt"
+METRIC_DEFINITIONS = {
+    "continuous": "original annotation events and decision-sample latency",
+    "pure": "legacy pure-window event blocks and compressed 0.5-second latency",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoints", type=Path, nargs="+")
     parser.add_argument("--checkpoint-glob", default=str(DEFAULT_PATTERN))
     parser.add_argument("--algorithm", choices=("argmax", "hard_vote", "candidate", "fast", "feature"), default="candidate")
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "results" / "test_session_metrics.json")
+    parser.add_argument("--window-mode", choices=("continuous", "pure"), default="continuous")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--vote-windows", type=int, default=3)
@@ -64,20 +75,42 @@ def checkpoint_paths(args: argparse.Namespace) -> list[Path]:
     return paths
 
 
-def load_test_data(path: Path, subject: int) -> dict[str, np.ndarray]:
+def load_test_data(path: Path, subject: int, window_mode: str) -> dict[str, np.ndarray]:
     with np.load(path) as data:
-        required = {"X", "y", "subject", "session", "split", "run", "segment"}
+        required = {
+            "X", "y", "subject", "session", "split", "run", "segment", "decision_sample", "is_pure",
+            "event_subject", "event_run", "event_label", "event_start", "event_stop", "sampling_rate",
+        }
         missing = required.difference(data.files)
         if missing:
             raise RuntimeError(f"data is missing {sorted(missing)}")
+
         mask = (data["subject"] == subject) & (data["session"] == 1) & (data["split"] == 2)
+        if window_mode == "pure":
+            mask &= data["is_pure"]
         if not mask.any():
             raise RuntimeError(f"subject {subject} has no test-session windows")
+
+        event_mask = data["event_subject"] == subject
         runs, segments = data["run"][mask], data["segment"][mask]
         streams = np.zeros(len(runs), dtype=np.int64)
         if len(streams) > 1:
             streams[1:] = np.cumsum((runs[1:] != runs[:-1]) | (segments[1:] != segments[:-1]))
-        return {"X": data["X"][mask].astype(np.float32), "y": data["y"][mask].astype(np.int64), "streams": streams}
+
+        return {
+            "X": data["X"][mask].astype(np.float32),
+            "y": data["y"][mask].astype(np.int64),
+            "run": runs,
+            "streams": streams,
+            "decision_sample": data["decision_sample"][mask],
+            "sampling_rate": int(data["sampling_rate"].item()),
+            "events": {
+                "run": data["event_run"][event_mask],
+                "label": data["event_label"][event_mask],
+                "start": data["event_start"][event_mask],
+                "stop": data["event_stop"][event_mask],
+            },
+        }
 
 
 def infer(model: torch.nn.Module, features: np.ndarray, device: torch.device, batch_size: int, need_features: bool) -> tuple[np.ndarray, np.ndarray | None]:
@@ -105,7 +138,7 @@ def evaluate(path: Path, args: argparse.Namespace, device: torch.device) -> dict
     missing = required.difference(checkpoint)
     if missing:
         raise RuntimeError(f"{path.name} is missing {sorted(missing)}")
-    data = load_test_data(args.data, int(checkpoint["subject"]))
+    data = load_test_data(args.data, int(checkpoint["subject"]), args.window_mode)
     x = ((data["X"] - checkpoint["mean"]) / checkpoint["std"]).astype(np.float32)
     stage1 = build_model(checkpoint["model"], 2, x.shape[1], x.shape[2]).to(device)
     stage2 = build_model(checkpoint["model"], 4, x.shape[1], x.shape[2]).to(device)
@@ -125,7 +158,25 @@ def evaluate(path: Path, args: argparse.Namespace, device: torch.device) -> dict
         output = feature_gate_commands(stage1_logits, stage2_logits, features, candidate_config(args), run_ids=data["streams"]); commands = output.commands
     else:
         output = candidate_commands(stage1_logits, stage2_logits, candidate_config(args), run_ids=data["streams"]); commands = output.commands
-    report = {**classification_metrics(data["y"], dense), **event_metrics(data["y"], commands, data["streams"]), "checkpoint": str(path), "subject": int(checkpoint["subject"]), "model": checkpoint["model"], "seed": checkpoint.get("seed")}
+    if args.window_mode == "pure":
+        event_report = legacy_event_metrics(data["y"], commands, data["streams"])
+    else:
+        event_report = continuous_event_metrics(
+            data["y"],
+            commands,
+            data["run"],
+            data["decision_sample"],
+            data["events"],
+            data["sampling_rate"],
+        )
+    report = {
+        **classification_metrics(data["y"], dense),
+        **event_report,
+        "checkpoint": str(path),
+        "subject": int(checkpoint["subject"]),
+        "model": checkpoint["model"],
+        "seed": checkpoint.get("seed"),
+    }
     if output is not None:
         report["diagnostics"] = policy_diagnostics(output.reasons)
     return report
@@ -136,9 +187,17 @@ def run(args: argparse.Namespace) -> dict:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     reports = [evaluate(path, args, device) for path in checkpoint_paths(args)]
-    result = {"split": "test_session", "algorithm": args.algorithm, "reports": reports, "summary": report_summary(reports)}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = {
+        "split": "test_session",
+        "window_mode": args.window_mode,
+        "metric_definition": METRIC_DEFINITIONS[args.window_mode],
+        "algorithm": args.algorithm,
+        "reports": reports,
+        "summary": report_summary(reports),
+    }
+    output = args.output or PROJECT_ROOT / "results" / f"test_session_{args.window_mode}_metrics.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
     return result
 

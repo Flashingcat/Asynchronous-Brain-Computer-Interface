@@ -21,11 +21,72 @@ def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     }
 
 
-def event_metrics(y_true: np.ndarray, commands: np.ndarray, streams: np.ndarray, *, step_seconds: float = 0.5) -> dict:
-    """Score one event per contiguous same-class window block within a segment."""
-    truth, emitted, stream = (np.asarray(value, dtype=np.int64) for value in (y_true, commands, streams))
+def continuous_event_metrics(
+    y_true: np.ndarray,
+    commands: np.ndarray,
+    runs: np.ndarray,
+    decision_samples: np.ndarray,
+    events: dict,
+    sampling_rate: int,
+) -> dict:
+    """Score commands against original events and decision sample times."""
+    truth, emitted, run_ids, decisions = (
+        np.asarray(value, dtype=np.int64) for value in (y_true, commands, runs, decision_samples)
+    )
+    if emitted.ndim != 1 or any(value.shape != emitted.shape for value in (truth, run_ids, decisions)):
+        raise ValueError("commands and window coordinates must align")
+
+    used: set[int] = set()
+    correct = wrong = miss = 0
+    latency: list[float] = []
+
+    # 原始事件表决定分母，窗口只负责提供事件内首次指令及其真实决策时刻。
+    event_rows = zip(events["run"], events["label"], events["start"], events["stop"])
+    for run, label, start, stop in event_rows:
+        inside = (run_ids == run) & (decisions >= start) & (decisions < stop)
+        indices = np.flatnonzero(inside & (emitted != -1))
+        if not len(indices):
+            miss += 1
+            continue
+
+        first = int(indices[0])
+        used.add(first)
+        if emitted[first] == label:
+            correct += 1
+        else:
+            wrong += 1
+        latency.append((int(decisions[first]) - int(start)) / sampling_rate)
+
+    extras = [index for index in np.flatnonzero(emitted != -1) if int(index) not in used]
+    idle_false = sum(truth[index] == 0 for index in extras)
+    total = len(events["run"])
+    return {
+        "event_count": total,
+        "event_correct": correct,
+        "event_wrong_class": wrong,
+        "event_miss": miss,
+        "event_hit_rate": None if not total else correct / total,
+        "idle_false_commands": int(idle_false),
+        "additional_event_commands": int(len(extras) - idle_false),
+        "command_count": int(np.count_nonzero(emitted != -1)),
+        "mean_latency_seconds": None if not latency else float(np.mean(latency)),
+        "median_latency_seconds": None if not latency else float(np.median(latency)),
+    }
+
+
+def legacy_event_metrics(
+    y_true: np.ndarray,
+    commands: np.ndarray,
+    streams: np.ndarray,
+    step_seconds: float = 0.5,
+) -> dict:
+    """Reproduce the old pure-window event and compressed-latency metrics."""
+    truth, emitted, stream = (
+        np.asarray(value, dtype=np.int64) for value in (y_true, commands, streams)
+    )
     if truth.ndim != 1 or emitted.shape != truth.shape or stream.shape != truth.shape:
         raise ValueError("truth, commands, and streams must align")
+
     events: list[tuple[int, int, int]] = []
     start = 0
     while start < len(truth):
@@ -35,6 +96,7 @@ def event_metrics(y_true: np.ndarray, commands: np.ndarray, streams: np.ndarray,
         if truth[start] != 0:
             events.append((start, end, int(truth[start])))
         start = end
+
     used: set[int] = set()
     correct = wrong = miss = 0
     latency: list[float] = []
@@ -43,19 +105,26 @@ def event_metrics(y_true: np.ndarray, commands: np.ndarray, streams: np.ndarray,
         if not len(indices):
             miss += 1
             continue
-        first = int(indices[0]); used.add(first)
+
+        first = int(indices[0])
+        used.add(first)
         if emitted[first] == label:
             correct += 1
         else:
             wrong += 1
         latency.append((first - start) * step_seconds)
+
     extras = [index for index in np.flatnonzero(emitted != -1) if int(index) not in used]
     idle_false = sum(truth[index] == 0 for index in extras)
     total = len(events)
     return {
-        "event_count": total, "event_correct": correct, "event_wrong_class": wrong, "event_miss": miss,
+        "event_count": total,
+        "event_correct": correct,
+        "event_wrong_class": wrong,
+        "event_miss": miss,
         "event_hit_rate": None if not total else correct / total,
-        "idle_false_commands": int(idle_false), "additional_event_commands": int(len(extras) - idle_false),
+        "idle_false_commands": int(idle_false),
+        "additional_event_commands": int(len(extras) - idle_false),
         "command_count": int(np.count_nonzero(emitted != -1)),
         "mean_latency_seconds": None if not latency else float(np.mean(latency)),
         "median_latency_seconds": None if not latency else float(np.median(latency)),
