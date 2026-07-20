@@ -72,7 +72,7 @@ def set_seed(seed: int) -> None:
 
 def load_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path) as data:
-        required = ["X", "y", "subject", "session", "run", "fold", "split"]
+        required = ["X", "y", "subject", "session", "run", "fold", "split", "is_pure"]
         missing = [key for key in required if key not in data]
         if missing:
             raise RuntimeError(f"Missing arrays in {path}: {missing}")
@@ -218,7 +218,8 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     model_name = normalize_model_name(args.model)
     subject_mask = arrays["subject"] == subject
     train_session = subject_mask & (arrays["split"] == 0)
-    if not train_session.any():
+    trainable = train_session & arrays["is_pure"].astype(bool)
+    if not trainable.any():
         raise RuntimeError(f"No train-session windows for subject {subject}")
 
     raw_x = arrays["X"].astype(np.float32)
@@ -230,9 +231,13 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     fold_reports: list[dict] = []
 
     augment_spec = None if args.augment == ["none"] else args.augment
+    aug_tag = "base" if augment_spec is None else "+".join(augment_spec)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
     for fold in folds:
+        # 增强训练也只用其他运行的纯窗口，留出运行仍保留完整连续流。
         val_mask = train_session & (arrays["fold"] == fold)
-        fold_train_mask = train_session & (arrays["fold"] != fold)
+        fold_train_mask = trainable & (arrays["fold"] != fold)
         print(f"\nSubject {subject:02d} fold {fold}: train={fold_train_mask.sum()} val={val_mask.sum()}")
         x_norm, mean, std = normalize_by_train(raw_x, fold_train_mask)
         binary_model, mi_model = train_stage_pair(model_name, x_norm, y, fold_train_mask, device, args,
@@ -243,10 +248,19 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         oof_binary_logits[local_positions] = val_binary_logits
         oof_mi_logits[local_positions] = val_mi_logits
         val_pred = hierarchical_from_logits(val_binary_logits, val_mi_logits)
+        fold_checkpoint = CHECKPOINT_DIR / f"s{subject:02d}_{model_name}_{aug_tag}_fold{fold}_validation.pt"
+        torch.save({
+            "model": model_name, "model_source": str(model_source(model_name)),
+            "subject": subject, "seed": args.seed, "augmentation": aug_tag, "held_out_run": fold,
+            "binary_state_dict": binary_model.state_dict(), "mi_state_dict": mi_model.state_dict(),
+            "mean": mean, "std": std,
+            "classes": {"binary": BINARY_CLASS_NAMES, "mi": MI_CLASS_NAMES, "final": FINAL_CLASS_NAMES},
+        }, fold_checkpoint)
         fold_reports.append({
             "fold": fold, "train_windows": int(fold_train_mask.sum()),
             "val_windows": int(val_mask.sum()),
             "final_5class": metrics(y[val_mask], val_pred, FINAL_CLASS_NAMES),
+            "checkpoint": fold_checkpoint.as_posix(),
         })
 
     if np.isnan(oof_binary_logits).any() or np.isnan(oof_mi_logits).any():
@@ -263,8 +277,8 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     }
 
     print(f"\nSubject {subject:02d}: final all-run training")
-    final_x, final_mean, final_std = normalize_by_train(raw_x, train_session)
-    final_binary, final_mi = train_stage_pair(model_name, final_x, y, train_session, device, args,
+    final_x, final_mean, final_std = normalize_by_train(raw_x, trainable)
+    final_binary, final_mi = train_stage_pair(model_name, final_x, y, trainable, device, args,
                                                f"s{subject:02d}/final", augment_spec=augment_spec)
     train_binary_logits = logits_for(final_binary, final_x[train_session], device, args.batch_size)
     train_mi_logits = logits_for(final_mi, final_x[train_session], device, args.batch_size)
@@ -277,9 +291,6 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         ),
     }
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
-    aug_tag = "base" if augment_spec is None else "+".join(augment_spec) if isinstance(augment_spec, list) else str(augment_spec)
     prefix = f"s{subject:02d}_{model_name}_{aug_tag}"
     checkpoint = CHECKPOINT_DIR / f"{prefix}_final.pt"
     prediction_file = TABLE_DIR / f"{prefix}_predictions.npz"
@@ -287,7 +298,7 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
 
     torch.save({
         "model": model_name, "model_source": str(model_source(model_name)),
-        "subject": subject, "augmentation": aug_tag,
+        "subject": subject, "seed": args.seed, "augmentation": aug_tag,
         "binary_state_dict": final_binary.state_dict(),
         "mi_state_dict": final_mi.state_dict(),
         "mean": final_mean, "std": final_std,
