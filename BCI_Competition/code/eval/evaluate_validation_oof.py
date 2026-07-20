@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import sys
 from collections import defaultdict
@@ -18,7 +17,9 @@ sys.path.insert(0, str(CODE_ROOT))
 from eval.metric import report_summary
 from eval.session_evaluator import (
     add_policy_args,
+    add_checkpoint_args,
     infer_checkpoint,
+    load_checkpoint_set,
     load_session_data,
     policy_identity,
     run_policy,
@@ -28,7 +29,6 @@ from eval.session_evaluator import (
 
 PROJECT_ROOT = CODE_ROOT.parent
 DEFAULT_DATA = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
-DEFAULT_PATTERN = PROJECT_ROOT / "results" / "checkpoints" / "simple_oof" / "*fold*_validation.pt"
 METRIC_DEFINITIONS = {
     "continuous": "original annotation events and decision-sample latency",
     "pure": "legacy pure-window event blocks and compressed 0.5-second latency",
@@ -38,19 +38,10 @@ METRIC_DEFINITIONS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    parser.add_argument("--checkpoints", type=Path, nargs="+")
-    parser.add_argument("--checkpoint-glob", default=str(DEFAULT_PATTERN))
     parser.add_argument("--output", type=Path)
+    add_checkpoint_args(parser)
     add_policy_args(parser)
     return parser.parse_args()
-
-
-def checkpoint_paths(args: argparse.Namespace) -> list[Path]:
-    paths = args.checkpoints or [Path(item) for item in sorted(glob.glob(args.checkpoint_glob, recursive=True))]
-    paths = [path.resolve() for path in paths]
-    if not paths or any(not path.is_file() for path in paths):
-        raise FileNotFoundError("no validation fold checkpoint found")
-    return paths
 
 
 def combine(parts: list[dict]) -> dict:
@@ -73,22 +64,12 @@ def combine(parts: list[dict]) -> dict:
     }
 
 
-def evaluate_subject(paths: list[Path], args: argparse.Namespace, device: torch.device) -> dict:
-    parts, checkpoints = [], []
-    for path in paths:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        required = {"subject", "held_out_run", "model", "seed"}
-        missing = required.difference(checkpoint)
-        if missing:
-            raise RuntimeError(f"{path.name} is missing {sorted(missing)}")
-        checkpoints.append((path, checkpoint))
-
+def evaluate_subject(checkpoints: list[tuple[Path, dict]], args: argparse.Namespace, device: torch.device) -> dict:
+    parts = []
     subjects = {int(checkpoint["subject"]) for _, checkpoint in checkpoints}
-    models = {checkpoint["model"] for _, checkpoint in checkpoints}
-    seeds = {checkpoint["seed"] for _, checkpoint in checkpoints}
     runs = [int(checkpoint["held_out_run"]) for _, checkpoint in checkpoints]
-    if any(len(values) != 1 for values in (subjects, models, seeds)) or len(runs) != len(set(runs)):
-        raise RuntimeError("one subject requires one model/seed and one checkpoint per run")
+    if len(subjects) != 1:
+        raise RuntimeError("validation group mixes subjects")
     subject = next(iter(subjects))
     expected_runs = sorted(set(load_session_data(args.data, subject, 0, args.window_mode)["run"].astype(int).tolist()))
     if sorted(runs) != expected_runs:
@@ -109,8 +90,8 @@ def evaluate_subject(paths: list[Path], args: argparse.Namespace, device: torch.
     return {
         **score(data, dense, commands, reasons, args.window_mode),
         "subject": subject,
-        "model": next(iter(models)),
-        "seed": next(iter(seeds)),
+        "model": checkpoints[0][1]["model"],
+        "seed": checkpoints[0][1]["seed"],
         "folds": expected_runs,
         "checkpoints": [str(part["path"]) for part in parts],
     }
@@ -120,16 +101,14 @@ def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    grouped: dict[int, list[Path]] = defaultdict(list)
-    for path in checkpoint_paths(args):
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        required = {"subject"}
-        missing = required.difference(checkpoint)
-        if missing:
-            raise RuntimeError(f"{path.name} is missing {sorted(missing)}")
-        grouped[int(checkpoint["subject"])].append(path)
+    checkpoints, experiment_id, experiment = load_checkpoint_set(args, "validation_fold")
+    grouped: dict[int, list[tuple[Path, dict]]] = defaultdict(list)
+    for path, checkpoint in checkpoints:
+        grouped[int(checkpoint["subject"])].append((path, checkpoint))
     reports = [evaluate_subject(grouped[subject], args, device) for subject in sorted(grouped)]
     result = {
+        "experiment_id": experiment_id,
+        "experiment": experiment,
         "split": "train_session_leave_one_run_out",
         "data": str(args.data.resolve()),
         "window_mode": args.window_mode,
@@ -139,7 +118,7 @@ def run(args: argparse.Namespace) -> dict:
         "reports": reports,
         "summary": report_summary(reports),
     }
-    output = args.output or PROJECT_ROOT / "results" / f"validation_oof_{args.window_mode}_metrics.json"
+    output = args.output or PROJECT_ROOT / "results" / f"{experiment_id}_validation_{args.window_mode}_metrics.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))

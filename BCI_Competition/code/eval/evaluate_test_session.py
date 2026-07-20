@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import sys
 from pathlib import Path
@@ -16,7 +15,9 @@ sys.path.insert(0, str(CODE_ROOT))
 from eval.metric import report_summary
 from eval.session_evaluator import (
     add_policy_args,
+    add_checkpoint_args,
     infer_checkpoint,
+    load_checkpoint_set,
     load_session_data,
     policy_identity,
     run_policy,
@@ -26,7 +27,6 @@ from eval.session_evaluator import (
 
 PROJECT_ROOT = CODE_ROOT.parent
 DEFAULT_DATA = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
-DEFAULT_PATTERN = PROJECT_ROOT / "results" / "checkpoints" / "**" / "*final.pt"
 METRIC_DEFINITIONS = {
     "continuous": "original annotation events and decision-sample latency",
     "pure": "legacy pure-window event blocks and compressed 0.5-second latency",
@@ -36,25 +36,13 @@ METRIC_DEFINITIONS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    parser.add_argument("--checkpoints", type=Path, nargs="+")
-    parser.add_argument("--checkpoint-glob", default=str(DEFAULT_PATTERN))
     parser.add_argument("--output", type=Path)
+    add_checkpoint_args(parser)
     add_policy_args(parser)
     return parser.parse_args()
 
 
-def checkpoint_paths(args: argparse.Namespace) -> list[Path]:
-    paths = args.checkpoints or [Path(item) for item in sorted(glob.glob(args.checkpoint_glob, recursive=True))]
-    paths = [path.resolve() for path in paths]
-    if not paths or any(not path.is_file() for path in paths):
-        raise FileNotFoundError("no final checkpoint found")
-    return paths
-
-
-def evaluate(path: Path, args: argparse.Namespace, device: torch.device) -> dict:
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if "subject" not in checkpoint:
-        raise RuntimeError(f"{path.name} is missing subject")
+def evaluate(path: Path, checkpoint: dict, args: argparse.Namespace, device: torch.device) -> dict:
     data = load_session_data(args.data, int(checkpoint["subject"]), 1, args.window_mode)
     stage1, stage2, features = infer_checkpoint(checkpoint, data, args, device)
     dense, commands, reasons = run_policy(stage1, stage2, data["streams"], features, args)
@@ -72,8 +60,11 @@ def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    reports = [evaluate(path, args, device) for path in checkpoint_paths(args)]
+    checkpoints, experiment_id, experiment = load_checkpoint_set(args, "final")
+    reports = [evaluate(path, checkpoint, args, device) for path, checkpoint in checkpoints]
     result = {
+        "experiment_id": experiment_id,
+        "experiment": experiment,
         "split": "test_session",
         "data": str(args.data.resolve()),
         "window_mode": args.window_mode,
@@ -83,7 +74,7 @@ def run(args: argparse.Namespace) -> dict:
         "reports": reports,
         "summary": report_summary(reports),
     }
-    output = args.output or PROJECT_ROOT / "results" / f"test_session_{args.window_mode}_metrics.json"
+    output = args.output or PROJECT_ROOT / "results" / f"{experiment_id}_test_{args.window_mode}_metrics.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))

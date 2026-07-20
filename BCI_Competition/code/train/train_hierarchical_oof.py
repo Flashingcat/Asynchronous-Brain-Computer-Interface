@@ -28,11 +28,12 @@ PROJECT_ROOT = Path("BCI_Competition") if Path("BCI_Competition/code").is_dir() 
 sys.path.insert(0, str(PROJECT_ROOT / "code"))
 
 from models.model_factory import available_models, build_model, model_source, normalize_model_name
+from experiment_identity import build_experiment
 
 
 DATA_FILE = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
-CHECKPOINT_DIR = PROJECT_ROOT / "results" / "checkpoints" / "simple_oof"
-TABLE_DIR = PROJECT_ROOT / "results" / "tables" / "simple_oof"
+CHECKPOINT_ROOT = PROJECT_ROOT / "results" / "checkpoints"
+TABLE_ROOT = PROJECT_ROOT / "results" / "tables"
 BINARY_CLASS_NAMES = ["idle", "task"]
 MI_CLASS_NAMES = ["left_hand", "right_hand", "feet", "tongue"]
 FINAL_CLASS_NAMES = ["idle", *MI_CLASS_NAMES]
@@ -156,18 +157,19 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray, names: list[str]) -> dict:
     }
 
 
-# 运行身份只由真正影响训练的生效配置生成，同一身份的所有产物共用同一前缀。
-def artifact_paths(subject: int, model_name: str) -> dict[str, Path]:
-    prefix = f"s{subject:02d}_{model_name}_hierarchical_final"
+# 同一实验身份的检查点和报告写入同一目录，避免不同配置互相覆盖。
+def artifact_paths(subject: int, args: argparse.Namespace) -> dict[str, Path]:
+    checkpoint_dir = CHECKPOINT_ROOT / args.experiment_id / f"subject_{subject:02d}"
+    table_dir = TABLE_ROOT / args.experiment_id / f"subject_{subject:02d}"
     return {
-        "checkpoint": CHECKPOINT_DIR / f"{prefix}_final.pt",
-        "predictions": TABLE_DIR / f"{prefix}_predictions.npz",
-        "metrics": TABLE_DIR / f"{prefix}_metrics.json",
+        "checkpoint": checkpoint_dir / "final.pt",
+        "predictions": table_dir / "final_predictions.npz",
+        "metrics": table_dir / "final_metrics.json",
     }
 
 
-def fold_checkpoint_path(subject: int, model_name: str, fold: int) -> Path:
-    return CHECKPOINT_DIR / f"s{subject:02d}_{model_name}_hierarchical_fold{fold}_validation.pt"
+def fold_checkpoint_path(subject: int, fold: int, args: argparse.Namespace) -> Path:
+    return CHECKPOINT_ROOT / args.experiment_id / f"subject_{subject:02d}" / f"fold_{fold}.pt"
 
 def train_stage_pair(
     model_name: str,
@@ -233,13 +235,18 @@ def run_subject(
         print(f"\nSubject {subject:02d} fold {fold}: train={fold_train_mask.sum()} val={val_mask.sum()}")
         x_norm, mean, std = normalize_by_train(raw_x, fold_train_mask)
         binary_model, mi_model = train_stage_pair(model_name, x_norm, y, fold_train_mask, device, args, f"s{subject:02d}/fold{fold}")
-        fold_checkpoint = fold_checkpoint_path(subject, model_name, fold)
+        fold_checkpoint = fold_checkpoint_path(subject, fold, args)
+        fold_checkpoint.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "model": model_name,
                 "model_source": str(model_source(model_name)),
                 "subject": subject,
                 "seed": args.seed,
+                "augmentation": ["none"],
+                "experiment_id": args.experiment_id,
+                "experiment": args.experiment,
+                "checkpoint_role": "validation_fold",
                 "held_out_run": fold,
                 "binary_state_dict": binary_model.state_dict(),
                 "mi_state_dict": mi_model.state_dict(),
@@ -286,14 +293,20 @@ def run_final_subject(
         ),
     }
 
-    paths = artifact_paths(subject, model_name)
+    paths = artifact_paths(subject, args)
     checkpoint, prediction_file, metrics_file = paths["checkpoint"], paths["predictions"], paths["metrics"]
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    prediction_file.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model_name,
             "model_source": str(model_source(model_name)),
             "subject": subject,
             "seed": args.seed,
+            "augmentation": ["none"],
+            "experiment_id": args.experiment_id,
+            "experiment": args.experiment,
+            "checkpoint_role": "final",
             "binary_state_dict": binary_model.state_dict(),
             "mi_state_dict": mi_model.state_dict(),
             "mean": mean,
@@ -316,6 +329,8 @@ def run_final_subject(
         "method": "final_two_stage_all_train_session",
         "model": model_name,
         "seed": args.seed,
+        "experiment_id": args.experiment_id,
+        "experiment": args.experiment,
         "final_all_train_metrics": train_metrics,
         "checkpoint": checkpoint.as_posix(),
         "prediction_file": prediction_file.as_posix(),
@@ -333,12 +348,16 @@ def main() -> None:
     if len(set(subjects)) != len(subjects):
         raise ValueError("subjects must not contain duplicates")
     subjects = sorted(subjects)
-    summary_file = TABLE_DIR / f"{args.model}_hierarchical_{args.run_mode}_summary.json"
-    # 在启动耗时训练前一次性检查全部目标，避免中途才发现覆盖冲突。
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    args.experiment_id, args.experiment = build_experiment(
+        "hierarchical_oof", args.model, args.seed, ["none"], args, args.data_file, PROJECT_ROOT
+    )
+    summary_dir = TABLE_ROOT / args.experiment_id
+    summary_file = summary_dir / f"{args.run_mode}_summary.json"
+    # 在启动耗时训练前一次性锁定实验身份和全部目标。
+    (CHECKPOINT_ROOT / args.experiment_id).mkdir(parents=True, exist_ok=True)
+    summary_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device={device}, model={args.model}")
+    print(f"Using device={device}, model={args.model}, experiment_id={args.experiment_id}")
     if args.run_mode == "final":
         reports = [run_final_subject(subject, arrays, args, device) for subject in subjects]
     elif args.run_mode == "validation":
@@ -350,7 +369,12 @@ def main() -> None:
                 "validation": run_subject(subject, arrays, args, device),
                 "final": run_final_subject(subject, arrays, args, device),
             })
-    summary = {"subjects": subjects, "reports": reports}
+    summary = {
+        "experiment_id": args.experiment_id,
+        "experiment": args.experiment,
+        "subjects": subjects,
+        "reports": reports,
+    }
     summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved summary: {summary_file}")
 

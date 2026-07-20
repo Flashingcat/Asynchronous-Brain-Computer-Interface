@@ -14,6 +14,7 @@ from .algorithms.fast_path import commands as fast_path_commands
 from .algorithms.feature_gate import commands as feature_gate_commands
 from .algorithms.hard_vote import commands as hard_vote_commands
 from .metric import classification_metrics, continuous_event_metrics, legacy_event_metrics, policy_diagnostics
+from experiment_identity import canonical_json, dataset_identity, validate_experiment_identity
 from models.model_factory import build_model
 
 
@@ -39,6 +40,53 @@ def add_policy_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fast-gap", type=float, default=0.25)
     parser.add_argument("--feature-max-change", type=float, default=0.50)
     parser.add_argument("--feature-consecutive", type=int, default=2)
+
+
+def add_checkpoint_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--experiment-dir", type=Path)
+    group.add_argument("--checkpoints", type=Path, nargs="+")
+
+
+def load_checkpoint_set(args: argparse.Namespace, role: str) -> tuple[list[tuple[Path, dict]], str, dict]:
+    """加载一个且仅一个实验身份下的 final 或 validation checkpoints。"""
+    if args.experiment_dir:
+        pattern = "subject_*/final.pt" if role == "final" else "subject_*/fold_*.pt"
+        paths = sorted(args.experiment_dir.glob(pattern))
+    else:
+        paths = [path.resolve() for path in args.checkpoints]
+    if not paths or any(not path.is_file() for path in paths):
+        raise FileNotFoundError(f"no {role} checkpoint found")
+
+    loaded, identities = [], []
+    for path in paths:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        experiment_id, experiment = validate_experiment_identity(checkpoint)
+        if checkpoint.get("checkpoint_role") != role:
+            raise RuntimeError(f"{path.name} is not a {role} checkpoint")
+        loaded.append((path.resolve(), checkpoint))
+        identities.append((experiment_id, canonical_json(experiment)))
+    if len(set(identities)) != 1:
+        raise RuntimeError("checkpoint set mixes different experiment identities")
+
+    experiment_id, _ = identities[0]
+    experiment = loaded[0][1]["experiment"]
+    preprocessing, dataset_hash = dataset_identity(args.data)
+    if dataset_hash != experiment["dataset_sha256"] or preprocessing != experiment["preprocessing"]:
+        raise RuntimeError("evaluation dataset does not match checkpoint experiment")
+    if args.experiment_dir and args.experiment_dir.resolve().name != experiment_id:
+        raise RuntimeError("experiment directory name does not match checkpoint identity")
+    if role == "final":
+        if any("subject" not in checkpoint for _, checkpoint in loaded):
+            raise RuntimeError("final checkpoint is missing subject")
+        keys = [int(checkpoint["subject"]) for _, checkpoint in loaded]
+    else:
+        if any("subject" not in checkpoint or "held_out_run" not in checkpoint for _, checkpoint in loaded):
+            raise RuntimeError("validation checkpoint is missing subject or held_out_run")
+        keys = [(int(checkpoint["subject"]), int(checkpoint["held_out_run"])) for _, checkpoint in loaded]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError(f"duplicate {role} checkpoint target")
+    return loaded, experiment_id, experiment
 
 
 def policy_config(args: argparse.Namespace) -> CandidateConfig:

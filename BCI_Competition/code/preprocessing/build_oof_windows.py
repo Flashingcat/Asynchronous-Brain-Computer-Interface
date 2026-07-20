@@ -34,6 +34,7 @@ the complete stream, including event-boundary windows.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,16 @@ FILTER_ORDER = 4
 
 CLASS_TO_ID = {"left_hand": 1, "right_hand": 2, "feet": 3, "tongue": 4}
 CLASS_NAMES = ["idle", "left_hand", "right_hand", "feet", "tongue"]
+PREPROCESSING_CONFIG = {
+    "schema_version": 1,
+    "sampling_rate": SAMPLING_RATE,
+    "window_samples": WINDOW_SAMPLES,
+    "stride_samples": STRIDE_SAMPLES,
+    "bandpass_hz": [LOW_HZ, HIGH_HZ],
+    "filter_order": FILTER_ORDER,
+    "artifact_policy": "annotations_and_source_trial_flags_v1",
+    "window_label_policy": "decision_sample_full_stream_v1",
+}
 
 
 @dataclass(frozen=True)
@@ -340,6 +351,7 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
     }
     output.update({key: np.asarray(value, dtype=np.int64) for key, value in event_arrays.items()})
     output["sampling_rate"] = np.asarray(SAMPLING_RATE, dtype=np.int64)
+    output["preprocessing_config"] = np.asarray(json.dumps(PREPROCESSING_CONFIG, sort_keys=True))
     return output, records
 
 
