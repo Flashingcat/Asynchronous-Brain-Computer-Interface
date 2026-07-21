@@ -28,11 +28,12 @@ PROJECT_ROOT = Path("BCI_Competition") if Path("BCI_Competition/code").is_dir() 
 sys.path.insert(0, str(PROJECT_ROOT / "code"))
 
 from models.model_factory import available_models, build_model, model_source, normalize_model_name
+from experiment_identity import build_experiment
 
 
 DATA_FILE = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
-CHECKPOINT_DIR = PROJECT_ROOT / "results" / "checkpoints" / "simple_oof"
-TABLE_DIR = PROJECT_ROOT / "results" / "tables" / "simple_oof"
+CHECKPOINT_ROOT = PROJECT_ROOT / "results" / "checkpoints"
+TABLE_ROOT = PROJECT_ROOT / "results" / "tables"
 BINARY_CLASS_NAMES = ["idle", "task"]
 MI_CLASS_NAMES = ["left_hand", "right_hand", "feet", "tongue"]
 FINAL_CLASS_NAMES = ["idle", *MI_CLASS_NAMES]
@@ -50,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--class-weight", choices=("none", "balanced"), default="balanced")
+    parser.add_argument("--run-mode", choices=("final", "validation", "both"), default="final")
     return parser.parse_args()
 
 
@@ -63,7 +65,7 @@ def set_seed(seed: int) -> None:
 
 def load_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path) as data:
-        required = ["X", "y", "subject", "session", "run", "fold", "split"]
+        required = ["X", "y", "subject", "session", "run", "fold", "split", "is_pure"]
         missing = [key for key in required if key not in data]
         if missing:
             raise RuntimeError(f"Missing arrays in {path}: {missing}")
@@ -74,6 +76,14 @@ def normalize_by_train(features: np.ndarray, train_mask: np.ndarray) -> tuple[np
     mean = features[train_mask].mean(axis=(0, 2), keepdims=True)
     std = features[train_mask].std(axis=(0, 2), keepdims=True).clip(min=1e-6)
     return ((features - mean) / std).astype(np.float32), mean.astype(np.float32), std.astype(np.float32)
+
+
+def validation_masks(arrays: dict[str, np.ndarray], subject: int, fold: int) -> tuple[np.ndarray, np.ndarray]:
+    """返回无泄漏训练掩码和完整连续留出运行掩码。"""
+    session = (arrays["subject"] == subject) & (arrays["split"] == 0)
+    train = session & arrays["is_pure"].astype(bool) & (arrays["fold"] != fold)
+    validation = session & (arrays["fold"] == fold)
+    return train, validation
 
 
 def class_weights(labels: np.ndarray, num_classes: int, device: torch.device, mode: str) -> torch.Tensor | None:
@@ -147,14 +157,19 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray, names: list[str]) -> dict:
     }
 
 
-# 运行身份只由真正影响训练的生效配置生成，同一身份的所有产物共用同一前缀。
-def artifact_paths(subject: int, model_name: str) -> dict[str, Path]:
-    prefix = f"s{subject:02d}_{model_name}_hierarchical_final"
+# 同一实验身份的检查点和报告写入同一目录，避免不同配置互相覆盖。
+def artifact_paths(subject: int, args: argparse.Namespace) -> dict[str, Path]:
+    checkpoint_dir = CHECKPOINT_ROOT / args.experiment_id / f"subject_{subject:02d}"
+    table_dir = TABLE_ROOT / args.experiment_id / f"subject_{subject:02d}"
     return {
-        "checkpoint": CHECKPOINT_DIR / f"{prefix}_final.pt",
-        "predictions": TABLE_DIR / f"{prefix}_predictions.npz",
-        "metrics": TABLE_DIR / f"{prefix}_metrics.json",
+        "checkpoint": checkpoint_dir / "final.pt",
+        "predictions": table_dir / "final_predictions.npz",
+        "metrics": table_dir / "final_metrics.json",
     }
+
+
+def fold_checkpoint_path(subject: int, fold: int, args: argparse.Namespace) -> Path:
+    return CHECKPOINT_ROOT / args.experiment_id / f"subject_{subject:02d}" / f"fold_{fold}.pt"
 
 def train_stage_pair(
     model_name: str,
@@ -206,121 +221,44 @@ def run_subject(
     args: argparse.Namespace,
     device: torch.device,
 ) -> dict:
-    # 每个受试者从同一显式 seed 独立开始，结果不依赖本次命令还训练了哪些受试者。
+    """训练并保存逐运行留一模型，评估由统一 evaluator 完成。"""
     set_seed(args.seed)
     model_name = normalize_model_name(args.model)
-    subject_mask = arrays["subject"] == subject
-    train_session = subject_mask & (arrays["split"] == 0)
-    if not train_session.any():
-        raise RuntimeError(f"No train-session windows for subject {subject}")
-
     raw_x = arrays["X"].astype(np.float32)
     y = arrays["y"].astype(np.int64)
+    train_session = (arrays["subject"] == subject) & (arrays["split"] == 0)
     folds = sorted(int(fold) for fold in np.unique(arrays["fold"][train_session]) if fold >= 0)
-    oof_binary_logits = np.full((train_session.sum(), 2), np.nan, dtype=np.float32)
-    oof_mi_logits = np.full((train_session.sum(), 4), np.nan, dtype=np.float32)
-    oof_indices = np.where(train_session)[0]
-    fold_reports: list[dict] = []
-
+    reports = []
     for fold in folds:
-        val_mask = train_session & (arrays["fold"] == fold)
-        fold_train_mask = train_session & (arrays["fold"] != fold)
+        # 训练只用其他运行的纯窗口；验证保留留出运行的完整连续流。
+        fold_train_mask, val_mask = validation_masks(arrays, subject, fold)
         print(f"\nSubject {subject:02d} fold {fold}: train={fold_train_mask.sum()} val={val_mask.sum()}")
         x_norm, mean, std = normalize_by_train(raw_x, fold_train_mask)
         binary_model, mi_model = train_stage_pair(model_name, x_norm, y, fold_train_mask, device, args, f"s{subject:02d}/fold{fold}")
-        val_binary_logits = logits_for(binary_model, x_norm[val_mask], device, args.batch_size)
-        val_mi_logits = logits_for(mi_model, x_norm[val_mask], device, args.batch_size)
-        local_positions = np.searchsorted(oof_indices, np.where(val_mask)[0])
-        oof_binary_logits[local_positions] = val_binary_logits
-        oof_mi_logits[local_positions] = val_mi_logits
-        val_pred = hierarchical_from_logits(val_binary_logits, val_mi_logits)
-        fold_reports.append(
+        fold_checkpoint = fold_checkpoint_path(subject, fold, args)
+        fold_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
             {
-                "fold": fold,
-                "train_windows": int(fold_train_mask.sum()),
-                "val_windows": int(val_mask.sum()),
-                "final_5class": metrics(y[val_mask], val_pred, FINAL_CLASS_NAMES),
-            }
+                "model": model_name,
+                "model_source": str(model_source(model_name)),
+                "subject": subject,
+                "seed": args.seed,
+                "augmentation": ["none"],
+                "experiment_id": args.experiment_id,
+                "experiment": args.experiment,
+                "checkpoint_role": "validation_fold",
+                "held_out_run": fold,
+                "binary_state_dict": binary_model.state_dict(),
+                "mi_state_dict": mi_model.state_dict(),
+                "mean": mean,
+                "std": std,
+                "classes": {"binary": BINARY_CLASS_NAMES, "mi": MI_CLASS_NAMES, "final": FINAL_CLASS_NAMES},
+            },
+            fold_checkpoint,
         )
-
-    if np.isnan(oof_binary_logits).any() or np.isnan(oof_mi_logits).any():
-        raise RuntimeError(f"OOF logits incomplete for subject {subject}")
-
-    oof_y = y[train_session]
-    oof_pred = hierarchical_from_logits(oof_binary_logits, oof_mi_logits)
-    oof_metrics = {
-        "final_5class": metrics(oof_y, oof_pred, FINAL_CLASS_NAMES),
-        "stage1_binary": metrics((oof_y > 0).astype(np.int64), oof_binary_logits.argmax(axis=1), BINARY_CLASS_NAMES),
-        "stage2_mi_on_true_task_windows": metrics(
-            oof_y[oof_y > 0] - 1,
-            oof_mi_logits[oof_y > 0].argmax(axis=1),
-            MI_CLASS_NAMES,
-        ),
-    }
-
-    print(f"\nSubject {subject:02d}: final all-run training")
-    final_x, final_mean, final_std = normalize_by_train(raw_x, train_session)
-    final_binary, final_mi = train_stage_pair(model_name, final_x, y, train_session, device, args, f"s{subject:02d}/final")
-    train_binary_logits = logits_for(final_binary, final_x[train_session], device, args.batch_size)
-    train_mi_logits = logits_for(final_mi, final_x[train_session], device, args.batch_size)
-    train_pred = hierarchical_from_logits(train_binary_logits, train_mi_logits)
-    train_metrics = {
-        "final_5class": metrics(oof_y, train_pred, FINAL_CLASS_NAMES),
-        "stage1_binary": metrics((oof_y > 0).astype(np.int64), train_binary_logits.argmax(axis=1), BINARY_CLASS_NAMES),
-        "stage2_mi_on_true_task_windows": metrics(
-            oof_y[oof_y > 0] - 1,
-            train_mi_logits[oof_y > 0].argmax(axis=1),
-            MI_CLASS_NAMES,
-        ),
-    }
-
-    paths = artifact_paths(subject, model_name)
-    checkpoint, prediction_file, metrics_file = paths["checkpoint"], paths["predictions"], paths["metrics"]
-
-    # checkpoint 先落盘并计算内容哈希，随后预测和指标都绑定这一个精确模型文件。
-    torch.save(
-        {
-            "model": model_name,
-            "model_source": str(model_source(model_name)),
-            "subject": subject,
-            "seed": args.seed,
-            "binary_state_dict": final_binary.state_dict(),
-            "mi_state_dict": final_mi.state_dict(),
-            "mean": final_mean,
-            "std": final_std,
-            "classes": {"binary": BINARY_CLASS_NAMES, "mi": MI_CLASS_NAMES, "final": FINAL_CLASS_NAMES},
-        },
-        checkpoint,
-    )
-    np.savez_compressed(
-        prediction_file,
-        index=oof_indices,
-        y_true=oof_y,
-        oof_binary_logits=oof_binary_logits,
-        oof_mi_logits=oof_mi_logits,
-        oof_pred=oof_pred,
-        final_train_binary_logits=train_binary_logits,
-        final_train_mi_logits=train_mi_logits,
-        final_train_pred=train_pred,
-    )
-    report = {
-        "dataset": "BNCI2014001",
-        "subject": subject,
-        "method": "leave_one_train_run_out_oof_then_final_all_train_runs",
-        "model": model_name,
-        "seed": args.seed,
-        "folds": folds,
-        "fold_reports": fold_reports,
-        "oof_metrics": oof_metrics,
-        "final_all_run_train_metrics": train_metrics,
-        "checkpoint": checkpoint.as_posix(),
-        "prediction_file": prediction_file.as_posix(),
-    }
-    metrics_file.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"Saved final model: {checkpoint}")
-    print(f"Saved predictions: {prediction_file}")
-    print(f"Saved metrics: {metrics_file}")
-    return report
+        reports.append({"fold": fold, "train_windows": int(fold_train_mask.sum()),
+                        "val_windows": int(val_mask.sum()), "checkpoint": fold_checkpoint.as_posix()})
+    return {"subject": subject, "model": model_name, "seed": args.seed, "folds": reports}
 
 
 def run_final_subject(
@@ -332,7 +270,8 @@ def run_final_subject(
     """Train one final two-stage model from all labelled train-session windows."""
     set_seed(args.seed)
     model_name = normalize_model_name(args.model)
-    train_mask = (arrays["subject"] == subject) & (arrays["split"] == 0)
+    # 最终模型同样只学习无边界歧义的纯窗口。
+    train_mask = (arrays["subject"] == subject) & (arrays["split"] == 0) & arrays["is_pure"].astype(bool)
     if not train_mask.any():
         raise RuntimeError(f"No train-session windows for subject {subject}")
 
@@ -354,14 +293,20 @@ def run_final_subject(
         ),
     }
 
-    paths = artifact_paths(subject, model_name)
+    paths = artifact_paths(subject, args)
     checkpoint, prediction_file, metrics_file = paths["checkpoint"], paths["predictions"], paths["metrics"]
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    prediction_file.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model_name,
             "model_source": str(model_source(model_name)),
             "subject": subject,
             "seed": args.seed,
+            "augmentation": ["none"],
+            "experiment_id": args.experiment_id,
+            "experiment": args.experiment,
+            "checkpoint_role": "final",
             "binary_state_dict": binary_model.state_dict(),
             "mi_state_dict": mi_model.state_dict(),
             "mean": mean,
@@ -384,6 +329,8 @@ def run_final_subject(
         "method": "final_two_stage_all_train_session",
         "model": model_name,
         "seed": args.seed,
+        "experiment_id": args.experiment_id,
+        "experiment": args.experiment,
         "final_all_train_metrics": train_metrics,
         "checkpoint": checkpoint.as_posix(),
         "prediction_file": prediction_file.as_posix(),
@@ -401,14 +348,33 @@ def main() -> None:
     if len(set(subjects)) != len(subjects):
         raise ValueError("subjects must not contain duplicates")
     subjects = sorted(subjects)
-    summary_file = TABLE_DIR / f"{args.model}_hierarchical_final_summary.json"
-    # 在启动耗时训练前一次性检查全部目标，避免中途才发现覆盖冲突。
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    args.experiment_id, args.experiment = build_experiment(
+        "hierarchical_oof", args.model, args.seed, ["none"], args, args.data_file, PROJECT_ROOT
+    )
+    summary_dir = TABLE_ROOT / args.experiment_id
+    summary_file = summary_dir / f"{args.run_mode}_summary.json"
+    # 在启动耗时训练前一次性锁定实验身份和全部目标。
+    (CHECKPOINT_ROOT / args.experiment_id).mkdir(parents=True, exist_ok=True)
+    summary_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device={device}, model={args.model}")
-    reports = [run_final_subject(subject, arrays, args, device) for subject in subjects]
-    summary = {"subjects": subjects, "reports": reports}
+    print(f"Using device={device}, model={args.model}, experiment_id={args.experiment_id}")
+    if args.run_mode == "final":
+        reports = [run_final_subject(subject, arrays, args, device) for subject in subjects]
+    elif args.run_mode == "validation":
+        reports = [run_subject(subject, arrays, args, device) for subject in subjects]
+    else:
+        reports = []
+        for subject in subjects:
+            reports.append({
+                "validation": run_subject(subject, arrays, args, device),
+                "final": run_final_subject(subject, arrays, args, device),
+            })
+    summary = {
+        "experiment_id": args.experiment_id,
+        "experiment": args.experiment,
+        "subjects": subjects,
+        "reports": reports,
+    }
     summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved summary: {summary_file}")
 

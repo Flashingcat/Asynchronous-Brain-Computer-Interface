@@ -54,7 +54,7 @@ python BCI_Competition/code/augmentation/train_augmented.py \
 ```bash
 python BCI_Competition/code/eval/evaluate_test_session.py \
     --algorithm argmax \
-    --checkpoints results/checkpoints/augmented/s01_eegnet_noise_trial_final.pt \
+    --experiment-dir BCI_Competition/results/checkpoints/<experiment_id> \
     --output results/eegnet_noise_trial_metrics.json
 ```
 

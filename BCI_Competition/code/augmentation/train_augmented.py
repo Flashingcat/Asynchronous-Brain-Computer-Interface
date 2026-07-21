@@ -26,13 +26,14 @@ PROJECT_ROOT = Path("BCI_Competition") if Path("BCI_Competition/code").is_dir() 
 sys.path.insert(0, str(PROJECT_ROOT / "code"))
 
 from models.model_factory import available_models, build_model, model_source, normalize_model_name
+from experiment_identity import build_experiment
 from augmentation import AugmentationPipeline, AugmentedDataset
 from augmentation.augmentations import _BUILTIN, _PAIR_BUILTIN
 
 # ---- shared constants (mirror train_hierarchical_oof.py) ----
 DATA_FILE = PROJECT_ROOT / "data" / "processed" / "bnci2014001_oof_windows.npz"
-CHECKPOINT_DIR = PROJECT_ROOT / "results" / "checkpoints" / "augmented"
-TABLE_DIR = PROJECT_ROOT / "results" / "tables" / "augmented"
+CHECKPOINT_ROOT = PROJECT_ROOT / "results" / "checkpoints"
+TABLE_ROOT = PROJECT_ROOT / "results" / "tables"
 BINARY_CLASS_NAMES = ["idle", "task"]
 MI_CLASS_NAMES = ["left_hand", "right_hand", "feet", "tongue"]
 FINAL_CLASS_NAMES = ["idle", *MI_CLASS_NAMES]
@@ -72,7 +73,7 @@ def set_seed(seed: int) -> None:
 
 def load_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path) as data:
-        required = ["X", "y", "subject", "session", "run", "fold", "split"]
+        required = ["X", "y", "subject", "session", "run", "fold", "split", "is_pure"]
         missing = [key for key in required if key not in data]
         if missing:
             raise RuntimeError(f"Missing arrays in {path}: {missing}")
@@ -218,7 +219,8 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     model_name = normalize_model_name(args.model)
     subject_mask = arrays["subject"] == subject
     train_session = subject_mask & (arrays["split"] == 0)
-    if not train_session.any():
+    trainable = train_session & arrays["is_pure"].astype(bool)
+    if not trainable.any():
         raise RuntimeError(f"No train-session windows for subject {subject}")
 
     raw_x = arrays["X"].astype(np.float32)
@@ -230,9 +232,11 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     fold_reports: list[dict] = []
 
     augment_spec = None if args.augment == ["none"] else args.augment
+    aug_tag = "base" if augment_spec is None else "+".join(augment_spec)
     for fold in folds:
+        # 增强训练也只用其他运行的纯窗口，留出运行仍保留完整连续流。
         val_mask = train_session & (arrays["fold"] == fold)
-        fold_train_mask = train_session & (arrays["fold"] != fold)
+        fold_train_mask = trainable & (arrays["fold"] != fold)
         print(f"\nSubject {subject:02d} fold {fold}: train={fold_train_mask.sum()} val={val_mask.sum()}")
         x_norm, mean, std = normalize_by_train(raw_x, fold_train_mask)
         binary_model, mi_model = train_stage_pair(model_name, x_norm, y, fold_train_mask, device, args,
@@ -243,10 +247,22 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         oof_binary_logits[local_positions] = val_binary_logits
         oof_mi_logits[local_positions] = val_mi_logits
         val_pred = hierarchical_from_logits(val_binary_logits, val_mi_logits)
+        fold_checkpoint = CHECKPOINT_ROOT / args.experiment_id / f"subject_{subject:02d}" / f"fold_{fold}.pt"
+        fold_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model": model_name, "model_source": str(model_source(model_name)),
+            "subject": subject, "seed": args.seed, "augmentation": args.experiment["augmentation"],
+            "experiment_id": args.experiment_id, "experiment": args.experiment,
+            "checkpoint_role": "validation_fold", "held_out_run": fold,
+            "binary_state_dict": binary_model.state_dict(), "mi_state_dict": mi_model.state_dict(),
+            "mean": mean, "std": std,
+            "classes": {"binary": BINARY_CLASS_NAMES, "mi": MI_CLASS_NAMES, "final": FINAL_CLASS_NAMES},
+        }, fold_checkpoint)
         fold_reports.append({
             "fold": fold, "train_windows": int(fold_train_mask.sum()),
             "val_windows": int(val_mask.sum()),
             "final_5class": metrics(y[val_mask], val_pred, FINAL_CLASS_NAMES),
+            "checkpoint": fold_checkpoint.as_posix(),
         })
 
     if np.isnan(oof_binary_logits).any() or np.isnan(oof_mi_logits).any():
@@ -263,8 +279,8 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
     }
 
     print(f"\nSubject {subject:02d}: final all-run training")
-    final_x, final_mean, final_std = normalize_by_train(raw_x, train_session)
-    final_binary, final_mi = train_stage_pair(model_name, final_x, y, train_session, device, args,
+    final_x, final_mean, final_std = normalize_by_train(raw_x, trainable)
+    final_binary, final_mi = train_stage_pair(model_name, final_x, y, trainable, device, args,
                                                f"s{subject:02d}/final", augment_spec=augment_spec)
     train_binary_logits = logits_for(final_binary, final_x[train_session], device, args.batch_size)
     train_mi_logits = logits_for(final_mi, final_x[train_session], device, args.batch_size)
@@ -277,17 +293,18 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         ),
     }
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
-    aug_tag = "base" if augment_spec is None else "+".join(augment_spec) if isinstance(augment_spec, list) else str(augment_spec)
-    prefix = f"s{subject:02d}_{model_name}_{aug_tag}"
-    checkpoint = CHECKPOINT_DIR / f"{prefix}_final.pt"
-    prediction_file = TABLE_DIR / f"{prefix}_predictions.npz"
-    metrics_file = TABLE_DIR / f"{prefix}_metrics.json"
+    checkpoint = CHECKPOINT_ROOT / args.experiment_id / f"subject_{subject:02d}" / "final.pt"
+    table_dir = TABLE_ROOT / args.experiment_id / f"subject_{subject:02d}"
+    prediction_file = table_dir / "final_predictions.npz"
+    metrics_file = table_dir / "final_metrics.json"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    table_dir.mkdir(parents=True, exist_ok=True)
 
     torch.save({
         "model": model_name, "model_source": str(model_source(model_name)),
-        "subject": subject, "augmentation": aug_tag,
+        "subject": subject, "seed": args.seed, "augmentation": args.experiment["augmentation"],
+        "experiment_id": args.experiment_id, "experiment": args.experiment,
+        "checkpoint_role": "final",
         "binary_state_dict": final_binary.state_dict(),
         "mi_state_dict": final_mi.state_dict(),
         "mean": final_mean, "std": final_std,
@@ -307,6 +324,7 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
         "method": "leave_one_train_run_out_oof_then_final_all_train_runs_with_augmentation",
         "data_file": args.data_file.as_posix(),
         "model": model_name, "seed": args.seed, "folds": folds,
+        "experiment_id": args.experiment_id, "experiment": args.experiment,
         "fold_reports": fold_reports, "oof_metrics": oof_metrics,
         "final_all_run_train_metrics": train_metrics,
         "checkpoint": checkpoint.as_posix(),
@@ -322,16 +340,21 @@ def run_subject(subject: int, arrays: dict[str, np.ndarray], args: argparse.Name
 def main() -> None:
     args = parse_args()
     args.model = normalize_model_name(args.model)
+    augmentation = ["none"] if args.augment == ["none"] else list(args.augment)
+    args.experiment_id, args.experiment = build_experiment(
+        "augmented", args.model, args.seed, augmentation, args, args.data_file, PROJECT_ROOT
+    )
     set_seed(args.seed)
     arrays = load_arrays(args.data_file)
     subjects = sorted(np.unique(arrays["subject"]).astype(int).tolist()) if args.all_subjects else args.subjects
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device={device}, model={args.model}, augment={args.augment}")
+    print(f"Using device={device}, model={args.model}, augment={args.augment}, experiment_id={args.experiment_id}")
     reports = [run_subject(subject, arrays, args, device) for subject in subjects]
-    aug_tag = "base" if args.augment == ["none"] else "+".join(args.augment)
-    summary_file = TABLE_DIR / f"{args.model}_{aug_tag}_oof_summary.json"
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
-    summary_file.write_text(json.dumps(reports, indent=2, ensure_ascii=False), encoding="utf-8")
+    summary_dir = TABLE_ROOT / args.experiment_id
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = summary_dir / "training_summary.json"
+    summary = {"experiment_id": args.experiment_id, "experiment": args.experiment, "reports": reports}
+    summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved summary: {summary_file}")
 
 

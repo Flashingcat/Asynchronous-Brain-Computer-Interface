@@ -25,11 +25,16 @@ Arrays:
   segment  independent clean segment id within a run
   decision_sample  original sample where the window decision is made
   is_pure  bool, whether the window is fully idle or fully inside one MI event
+
+The window table keeps the complete causal stream for both sessions. Training
+must select ``is_pure`` windows explicitly; validation and test evaluation use
+the complete stream, including event-boundary windows.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +57,16 @@ FILTER_ORDER = 4
 
 CLASS_TO_ID = {"left_hand": 1, "right_hand": 2, "feet": 3, "tongue": 4}
 CLASS_NAMES = ["idle", "left_hand", "right_hand", "feet", "tongue"]
+PREPROCESSING_CONFIG = {
+    "schema_version": 1,
+    "sampling_rate": SAMPLING_RATE,
+    "window_samples": WINDOW_SAMPLES,
+    "stride_samples": STRIDE_SAMPLES,
+    "bandpass_hz": [LOW_HZ, HIGH_HZ],
+    "filter_order": FILTER_ORDER,
+    "artifact_policy": "annotations_and_source_trial_flags_v1",
+    "window_label_policy": "decision_sample_full_stream_v1",
+}
 
 
 @dataclass(frozen=True)
@@ -280,6 +295,7 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
     }
     event_arrays: dict[str, list[int]] = {
         "event_subject": [],
+        "event_session": [],
         "event_run": [],
         "event_label": [],
         "event_start": [],
@@ -297,8 +313,9 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
                 artifact_key = (session_id, run_index)
                 if artifact_key not in trial_artifacts:
                     raise RuntimeError(f"missing source artifact flags for subject {subject}, run {artifact_key}")
+                # 训练和测试均保存完整连续流；模型训练阶段再用 is_pure 选择无歧义窗口。
                 run_arrays, events, info = build_run_windows(
-                    raw, trial_artifacts[artifact_key], pure_only=is_train_session
+                    raw, trial_artifacts[artifact_key], pure_only=False
                 )
                 n = len(run_arrays["y"])
                 for key, value in run_arrays.items():
@@ -308,13 +325,14 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
                 arrays["run"].append(np.full(n, run_index, dtype=np.int64))
                 arrays["fold"].append(np.full(n, run_index if is_train_session else -1, dtype=np.int64))
                 arrays["split"].append(np.full(n, split_id, dtype=np.int64))
-                if not is_train_session:
-                    for event in events:
-                        event_arrays["event_subject"].append(subject)
-                        event_arrays["event_run"].append(run_index)
-                        event_arrays["event_label"].append(event.label)
-                        event_arrays["event_start"].append(event.start)
-                        event_arrays["event_stop"].append(event.stop)
+                # 两个 session 的事件都进入同一张带身份的事件表，供 OOF 与测试共用评估器。
+                for event in events:
+                    event_arrays["event_subject"].append(subject)
+                    event_arrays["event_session"].append(session_id)
+                    event_arrays["event_run"].append(run_index)
+                    event_arrays["event_label"].append(event.label)
+                    event_arrays["event_start"].append(event.start)
+                    event_arrays["event_stop"].append(event.stop)
                 record = {
                     "subject": subject,
                     "session": session_name,
@@ -333,6 +351,7 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
     }
     output.update({key: np.asarray(value, dtype=np.int64) for key, value in event_arrays.items()})
     output["sampling_rate"] = np.asarray(SAMPLING_RATE, dtype=np.int64)
+    output["preprocessing_config"] = np.asarray(json.dumps(PREPROCESSING_CONFIG, sort_keys=True))
     return output, records
 
 
